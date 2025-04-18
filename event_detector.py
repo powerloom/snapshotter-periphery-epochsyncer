@@ -7,9 +7,14 @@ from redis import asyncio as aioredis
 from utils.rpc import RpcHelper, get_event_sig_and_abi
 from utils.redis.redis_conn import RedisPool
 from utils.redis.redis_keys import block_cache_key
+import dramatiq
+from dramatiq.brokers.redis import RedisBroker
+from dramatiq.middleware.asyncio import AsyncIO
 
 class EpochEventDetector:
     _redis: aioredis.Redis
+    _broker: RedisBroker
+
     def __init__(self):
         self.settings = get_core_config()
         self._powerloom_rpc_helper = RpcHelper(self.settings.powerloom_rpc)
@@ -17,6 +22,37 @@ class EpochEventDetector:
         self._last_processed_block = None
         with open('utils/abi/ProtocolContract.json', 'r') as f:
             self.protocol_state_abi = json.load(f)
+        
+        # Configure Redis broker with minimal middleware
+        self._broker = RedisBroker(
+            host=self.settings.redis.host,
+            port=self.settings.redis.port
+        )
+        self._broker.add_middleware(AsyncIO())
+        
+        # Remove Prometheus middleware to avoid errors
+        middleware = self._broker.middleware[:]  # Make a copy
+        for m in middleware:
+            if m.__class__.__name__ == 'Prometheus':
+                self._broker.middleware.remove(m)
+        
+        dramatiq.set_broker(self._broker)
+
+    @dramatiq.actor(queue_name="epoch_sync")
+    def send_epoch_sync_message(self, data_market_address: str, epoch_id: int, begin: int, end: int, timestamp: int):
+        """
+        Actor that sends epoch sync messages to workers
+        """
+        self.logger.info(
+            "Sending epoch sync message - DataMarket: {}, EpochId: {}, Begin: {}, End: {}, Timestamp: {}",
+            data_market_address,
+            epoch_id,
+            begin,
+            end,
+            timestamp
+        )
+        # TODO: Implement the actual message sending logic to workers
+        return True
 
     async def init(self):
         """Initialize RPC connection"""
@@ -64,8 +100,16 @@ class EpochEventDetector:
                 event.args.timestamp
             )
             
+            # Send message to workers via Dramatiq
+            self.send_epoch_sync_message.send(
+                data_market_address=event.args.dataMarketAddress,
+                epoch_id=event.args.epochId,
+                begin=event.args.begin,
+                end=event.args.end,
+                timestamp=event.args.timestamp
+            )
+            
             # check the redis cache whether block details are already present
-            # TODO: launch a background task to check for availability of blocks in redis
             cached_blocks_zset = block_cache_key(self.settings.namespace)
             block_details = await self._redis.zrangebyscore(
                 name=cached_blocks_zset, 

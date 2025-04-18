@@ -661,6 +661,30 @@ toolz = ">=0.8.0"
 cython = ["cython"]
 
 [[package]]
+name = "dramatiq"
+version = "1.17.1"
+description = "Background Processing for Python 3."
+optional = false
+python-versions = ">=3.8"
+groups = ["main"]
+files = [
+    {file = "dramatiq-1.17.1-py3-none-any.whl", hash = "sha256:951cdc334478dff8e5150bb02a6f7a947d215ee24b5aedaf738eff20e17913df"},
+    {file = "dramatiq-1.17.1.tar.gz", hash = "sha256:2675d2f57e0d82db3a7d2a60f1f9c536365349db78c7f8d80a63e4c54697647a"},
+]
+
+[package.dependencies]
+prometheus-client = ">=0.2"
+
+[package.extras]
+all = ["gevent (>=1.1)", "pika (>=1.0,<2.0)", "pylibmc (>=1.5,<2.0)", "redis (>=2.0,<6.0)", "watchdog (>=4.0)", "watchdog-gevent (>=0.2)"]
+dev = ["alabaster", "bumpversion", "flake8", "flake8-bugbear", "flake8-quotes", "gevent (>=1.1)", "hiredis", "isort", "mypy", "pika (>=1.0,<2.0)", "pylibmc (>=1.5,<2.0)", "pytest", "pytest-benchmark[histogram]", "pytest-cov", "redis (>=2.0,<6.0)", "sphinx", "sphinxcontrib-napoleon", "tox", "twine", "watchdog (>=4.0)", "watchdog-gevent (>=0.2)", "wheel"]
+gevent = ["gevent (>=1.1)"]
+memcached = ["pylibmc (>=1.5,<2.0)"]
+rabbitmq = ["pika (>=1.0,<2.0)"]
+redis = ["redis (>=2.0,<6.0)"]
+watch = ["watchdog (>=4.0)", "watchdog-gevent (>=0.2)"]
+
+[[package]]
 name = "eth-abi"
 version = "5.2.0"
 description = "eth_abi: Python utilities for working with Ethereum ABI definitions, especially encoding and decoding"
@@ -1125,6 +1149,21 @@ files = [
 
 [package.dependencies]
 regex = ">=2022.3.15"
+
+[[package]]
+name = "prometheus-client"
+version = "0.21.1"
+description = "Python client for the Prometheus monitoring system."
+optional = false
+python-versions = ">=3.8"
+groups = ["main"]
+files = [
+    {file = "prometheus_client-0.21.1-py3-none-any.whl", hash = "sha256:594b45c410d6f4f8888940fe80b5cc2521b305a1fafe1c58609ef715a001f301"},
+    {file = "prometheus_client-0.21.1.tar.gz", hash = "sha256:252505a722ac04b0456be05c05f75f45d760c2911ffc45f2a06bcaed9f3ae3fb"},
+]
+
+[package.extras]
+twisted = ["twisted"]
 
 [[package]]
 name = "propcache"
@@ -1964,4 +2003,4 @@ propcache = ">=0.2.1"
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.12"
-content-hash = "5422274d36fb52b046ddfcd506b047360cabd9fd3a29036cd35f50cfd4ff34ef"
+content-hash = "27ddff8c0d058f4af330c0e666a581b20caa7d03382d11821cc8e085e7f4bb70"
