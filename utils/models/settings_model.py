@@ -49,3 +49,4 @@ class Settings(BaseModel):
     protocol_state_contract_address: str
     data_market_contract_address: str
     namespace: str
+    instance_id: str

@@ -1,58 +1,32 @@
 import asyncio
 import json
-from utils.logging import logger, configure_file_logging
-from config.loader import get_core_config
-from web3 import Web3
-from redis import asyncio as aioredis
-from utils.rpc import RpcHelper, get_event_sig_and_abi
-from utils.redis.redis_conn import RedisPool
-from utils.redis.redis_keys import block_cache_key
 import dramatiq
+from web3 import Web3
 from dramatiq.brokers.redis import RedisBroker
 from dramatiq.middleware.asyncio import AsyncIO
+from redis import asyncio as aioredis
+from utils.logging import logger, configure_file_logging
+from config.loader import get_core_config
+from utils.rpc import RpcHelper, get_event_sig_and_abi
+from utils.redis.redis_conn import RedisPool
+from utils.redis.redis_keys import block_cache_key, block_tx_htable_key
+from utils.models.message_models import EpochReleasedEvent
 
 class EpochEventDetector:
     _redis: aioredis.Redis
     _broker: RedisBroker
+    _cache_check_tasks: dict[str, asyncio.Task]
 
     def __init__(self):
         self.settings = get_core_config()
         self._powerloom_rpc_helper = RpcHelper(self.settings.powerloom_rpc)
         self.logger = logger.bind(module='EpochEventDetector')
         self._last_processed_block = None
+        self._cache_check_tasks = {}
         with open('utils/abi/ProtocolContract.json', 'r') as f:
             self.protocol_state_abi = json.load(f)
+        self._event_detection_q = f'powerloom-event-detector_{self.settings.namespace}_{self.settings.instance_id}'
         
-        # Configure Redis broker with minimal middleware
-        self._broker = RedisBroker(
-            host=self.settings.redis.host,
-            port=self.settings.redis.port
-        )
-        self._broker.add_middleware(AsyncIO())
-        
-        # Remove Prometheus middleware to avoid errors
-        middleware = self._broker.middleware[:]  # Make a copy
-        for m in middleware:
-            if m.__class__.__name__ == 'Prometheus':
-                self._broker.middleware.remove(m)
-        
-        dramatiq.set_broker(self._broker)
-
-    @dramatiq.actor(queue_name="epoch_sync")
-    def send_epoch_sync_message(self, data_market_address: str, epoch_id: int, begin: int, end: int, timestamp: int):
-        """
-        Actor that sends epoch sync messages to workers
-        """
-        self.logger.info(
-            "Sending epoch sync message - DataMarket: {}, EpochId: {}, Begin: {}, End: {}, Timestamp: {}",
-            data_market_address,
-            epoch_id,
-            begin,
-            end,
-            timestamp
-        )
-        # TODO: Implement the actual message sending logic to workers
-        return True
 
     async def init(self):
         """Initialize RPC connection"""
@@ -77,7 +51,88 @@ class EpochEventDetector:
             EVENTS_ABI,
         )
         self._redis = await RedisPool.get_pool()
-        self.logger.info("✅ Successfully connected to Redis.")
+        # Configure Redis broker with minimal middleware
+        self._broker = RedisBroker(
+            host=self.settings.redis.host,
+            port=self.settings.redis.port
+        )
+        self._broker.add_middleware(AsyncIO())
+        
+        # Remove Prometheus middleware to avoid errors
+        middleware = self._broker.middleware[:]  # Make a copy
+        for m in middleware:
+            if m.__class__.__name__ == 'Prometheus':
+                self._broker.middleware.remove(m)
+        
+        dramatiq.set_broker(self._broker)
+
+    async def _check_cache_and_send(self, event, polling_interval: int = 1):
+        """
+        Background task to check cache availability and send message when ready
+        """
+        task_id = f"{event.args.epochId}_{event.args.begin}_{event.args.end}"
+        blocks_cached = False
+        block_txs_cached = False
+        # map block number to list of tx hashes
+        expected_block_txs_cache = dict()
+        # boolean map of block number to status whether all tx hashes are cached
+        expected_txs_cached_status = {block_num: False for block_num in range(event.args.begin, event.args.end + 1)}
+        try:
+            while True:
+                if not blocks_cached:
+                    cached_blocks_zset = block_cache_key(self.settings.namespace)
+                    block_details = await self._redis.zrangebyscore(
+                        name=cached_blocks_zset, 
+                        min=event.args.begin, 
+                        max=event.args.end, 
+                        withscores=True,
+                        score_cast_func=int
+                    )
+                    
+                    value_scores = {x[1] for x in block_details}
+                    for block_deets, block_num in block_details:
+                        expected_block_txs_cache.update({int(block_num): json.loads(block_deets)['transactions']})
+                    if all(block_num in value_scores for block_num in range(event.args.begin, event.args.end + 1)):
+                        self.logger.info("✅ Block cache found in Redis in range {} to {}", event.args.begin, event.args.end)
+                        blocks_cached = True
+                else:
+                    self.logger.info("Waiting for blocks in range {} to {} to be cached", event.args.begin, event.args.end)
+                if not block_txs_cached:
+                    for block_num in range(event.args.begin, event.args.end + 1):
+                        if block_num in expected_block_txs_cache:
+                            block_htable_txs_cached = await self._redis.hkeys(block_tx_htable_key(self.settings.namespace, block_num))
+                            self.logger.info('Checking {} keys in block {} txs htable cache against expected {} txs', len(block_htable_txs_cached), block_num, len(expected_block_txs_cache[block_num]))
+                            expected_txs_cached_status[block_num] = all(tx_hash in block_htable_txs_cached for tx_hash in expected_block_txs_cache[block_num])
+                    if all(expected_txs_cached_status.values()):
+                        self.logger.info("✅ All txs cached in block range {} to {}", event.args.begin, event.args.end)
+                        block_txs_cached = True
+                if blocks_cached and block_txs_cached:
+                    break
+                await asyncio.sleep(polling_interval)
+            self.logger.info("✅ Block and tx receipt cache found in Redis in range {} to {}", event.args.begin, event.args.end)
+            worker_epoch_released_event = EpochReleasedEvent(
+                epochId=event.args.epochId,
+                begin=event.args.begin,
+                end=event.args.end,
+                timestamp=event.args.timestamp
+            )
+            dramatiq.broker.get_broker().enqueue(
+                dramatiq.Message(
+                    queue_name=self._event_detection_q,
+                    actor_name='handleEvent',
+                    args=('EpochReleased', worker_epoch_released_event.model_dump_json()),
+                    kwargs={},
+                    options={},
+                ),
+            )
+            self.logger.info("✅ Sent message to handleEvent for epoch {} in range {} to {}", event.args.epochId, event.args.begin, event.args.end)
+            # Remove task from tracking
+            if task_id in self._cache_check_tasks:
+                del self._cache_check_tasks[task_id]
+        except Exception as e:
+            self.logger.error("Error in cache checking task: {}", str(e))
+            if task_id in self._cache_check_tasks:
+                del self._cache_check_tasks[task_id]
 
     async def get_events(self, from_block: int, to_block: int):
         """Get EpochReleased events in block range"""
@@ -100,30 +155,12 @@ class EpochEventDetector:
                 event.args.timestamp
             )
             
-            # Send message to workers via Dramatiq
-            self.send_epoch_sync_message.send(
-                data_market_address=event.args.dataMarketAddress,
-                epoch_id=event.args.epochId,
-                begin=event.args.begin,
-                end=event.args.end,
-                timestamp=event.args.timestamp
-            )
-            
-            # check the redis cache whether block details are already present
-            cached_blocks_zset = block_cache_key(self.settings.namespace)
-            block_details = await self._redis.zrangebyscore(
-                name=cached_blocks_zset, 
-                min=event.args.begin, 
-                max=event.args.end, 
-                withscores=True
-            )
-            
-            value_scores = {int(score) for _, score in block_details}
-            # check if all blocks are present in the redis cache
-            if all(block_num in value_scores for block_num in range(event.args.begin, event.args.end + 1)):
-                self.logger.info("✅ Block cache found in Redis in range {} to {}", event.args.begin, event.args.end)
-            else:
-                self.logger.info("❌ Block cache not found in Redis in range {} to {}", event.args.begin, event.args.end)
+            # # Start background task to check cache and send message when ready
+            task_id = f"{event.args.epochId}_{event.args.begin}_{event.args.end}"
+            if task_id not in self._cache_check_tasks:
+                self._cache_check_tasks[task_id] = asyncio.create_task(
+                    self._check_cache_and_send(event, polling_interval=1)
+                )
             
         return events
 

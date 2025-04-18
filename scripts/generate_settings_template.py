@@ -59,7 +59,8 @@ def generate_template():
         },
         "protocol_state_contract_address": "${PROTOCOL_STATE_CONTRACT_ADDRESS}",
         "data_market_contract_address": "${DATA_MARKET_CONTRACT_ADDRESS}",
-        "namespace": "${NAMESPACE}"
+        "namespace": "${NAMESPACE}",
+        "instance_id": "${INSTANCE_ID}"
     }
 
     # Ensure config directory exists
