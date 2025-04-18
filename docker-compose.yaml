@@ -19,6 +19,13 @@ services:
       - POWERLOOM_RPC_RETRY
       - POWERLOOM_RPC_TIMEOUT
       - POWERLOOM_RPC_POLLING_INTERVAL
+      # Redis Configuration
+      - REDIS_HOST
+      - REDIS_PORT
+      - REDIS_DB
+      - REDIS_PASSWORD
+      - REDIS_SSL
+      - REDIS_CLUSTER
       # Contract Configuration
       - PROTOCOL_STATE_CONTRACT_ADDRESS
       - DATA_MARKET_CONTRACT_ADDRESS

@@ -49,6 +49,14 @@ def generate_template():
         "logs": {
             "write_to_files": "${WRITE_LOGS_TO_FILES}"
         },
+        "redis": {
+            "host": "${REDIS_HOST}",
+            "port": "${REDIS_PORT}",
+            "db": "${REDIS_DB}",
+            "password": "${REDIS_PASSWORD}",
+            "ssl": "${REDIS_SSL}",
+            "cluster_mode": "${REDIS_CLUSTER_MODE}"
+        },
         "protocol_state_contract_address": "${PROTOCOL_STATE_CONTRACT_ADDRESS}",
         "data_market_contract_address": "${DATA_MARKET_CONTRACT_ADDRESS}",
         "namespace": "${NAMESPACE}"

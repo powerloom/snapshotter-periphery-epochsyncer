@@ -1,12 +1,15 @@
 import asyncio
+import json
 from utils.logging import logger, configure_file_logging
 from config.loader import get_core_config
-from utils.rpc import RpcHelper, get_event_sig_and_abi
 from web3 import Web3
-import json
-
+from redis import asyncio as aioredis
+from utils.rpc import RpcHelper, get_event_sig_and_abi
+from utils.redis.redis_conn import RedisPool
+from utils.redis.redis_keys import block_cache_key
 
 class EpochEventDetector:
+    _redis: aioredis.Redis
     def __init__(self):
         self.settings = get_core_config()
         self._powerloom_rpc_helper = RpcHelper(self.settings.powerloom_rpc)
@@ -37,6 +40,8 @@ class EpochEventDetector:
             EVENT_SIGS,
             EVENTS_ABI,
         )
+        self._redis = await RedisPool.get_pool()
+        self.logger.info("✅ Successfully connected to Redis.")
 
     async def get_events(self, from_block: int, to_block: int):
         """Get EpochReleased events in block range"""
@@ -58,10 +63,28 @@ class EpochEventDetector:
                 event.args.end,
                 event.args.timestamp
             )
-        
+            
+            # check the redis cache whether block details are already present
+            # TODO: launch a background task to check for availability of blocks in redis
+            cached_blocks_zset = block_cache_key(self.settings.namespace)
+            block_details = await self._redis.zrangebyscore(
+                name=cached_blocks_zset, 
+                min=event.args.begin, 
+                max=event.args.end, 
+                withscores=True
+            )
+            
+            value_scores = {int(score) for _, score in block_details}
+            # check if all blocks are present in the redis cache
+            if all(block_num in value_scores for block_num in range(event.args.begin, event.args.end + 1)):
+                self.logger.info("✅ Block cache found in Redis in range {} to {}", event.args.begin, event.args.end)
+            else:
+                self.logger.info("❌ Block cache not found in Redis in range {} to {}", event.args.begin, event.args.end)
+            
         return events
 
     async def detect_events(self):
+        first_run = True
         """Main event detection loop"""
         try:
             while True:
@@ -75,12 +98,13 @@ class EpochEventDetector:
                     if current_block > self._last_processed_block:
                         # Get events from last processed to current
                         await self.get_events(
-                            from_block=self._last_processed_block + 1,
+                            from_block=self._last_processed_block + 1 if not first_run else self._last_processed_block,
                             to_block=current_block
                         )
                         self._last_processed_block = current_block
                     
                     # Wait before next check
+                    first_run = False
                     await asyncio.sleep(self.settings.powerloom_rpc.polling_interval)
 
                 except Exception as e:
