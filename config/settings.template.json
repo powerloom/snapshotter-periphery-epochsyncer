@@ -1,0 +1,50 @@
+{
+  "source_rpc": {
+    "full_nodes": [
+      {
+        "url": "${SOURCE_RPC_URL}",
+        "rate_limit": {
+          "requests_per_second": "${SOURCE_RPC_RATE_LIMIT}"
+        }
+      }
+    ],
+    "archive_nodes": null,
+    "force_archive_blocks": null,
+    "retry": "${SOURCE_RPC_MAX_RETRIES}",
+    "request_time_out": "${SOURCE_RPC_TIMEOUT}",
+    "connection_limits": {
+      "max_connections": 100,
+      "max_keepalive_connections": 50,
+      "keepalive_expiry": 300
+    },
+    "polling_interval": "${SOURCE_RPC_POLLING_INTERVAL}",
+    "semaphore_value": 20
+  },
+  "powerloom_rpc": {
+    "full_nodes": [
+      {
+        "url": "${POWERLOOM_RPC_URL}",
+        "rate_limit": {
+          "requests_per_second": "${POWERLOOM_RPC_RATE_LIMIT}"
+        }
+      }
+    ],
+    "archive_nodes": null,
+    "force_archive_blocks": null,
+    "retry": "${POWERLOOM_RPC_RETRY}",
+    "request_time_out": "${POWERLOOM_RPC_TIMEOUT}",
+    "connection_limits": {
+      "max_connections": 100,
+      "max_keepalive_connections": 50,
+      "keepalive_expiry": 300
+    },
+    "polling_interval": "${POWERLOOM_RPC_POLLING_INTERVAL}",
+    "semaphore_value": 20
+  },
+  "logs": {
+    "write_to_files": "${WRITE_LOGS_TO_FILES}"
+  },
+  "protocol_state_contract_address": "${PROTOCOL_STATE_CONTRACT_ADDRESS}",
+  "data_market_contract_address": "${DATA_MARKET_CONTRACT_ADDRESS}",
+  "namespace": "${NAMESPACE}"
+}

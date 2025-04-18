@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  epochsyncer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: epochsyncer
+    environment:
+      # Source RPC Configuration
+      - SOURCE_RPC_URL
+      - SOURCE_RPC_RATE_LIMIT
+      - SOURCE_RPC_MAX_RETRIES
+      - SOURCE_RPC_TIMEOUT
+      - SOURCE_RPC_POLLING_INTERVAL
+      # Powerloom RPC Configuration
+      - POWERLOOM_RPC_URL
+      - POWERLOOM_RPC_RATE_LIMIT
+      - POWERLOOM_RPC_RETRY
+      - POWERLOOM_RPC_TIMEOUT
+      - POWERLOOM_RPC_POLLING_INTERVAL
+      # Contract Configuration
+      - PROTOCOL_STATE_CONTRACT_ADDRESS
+      - DATA_MARKET_CONTRACT_ADDRESS
+      # Application Configuration
+      - POLLING_INTERVAL
+      # Logging Configuration
+      - LOG_LEVEL
+      - LOG_FILE_PATH
+      - LOG_ROTATION
+      - LOG_RETENTION
+      - WRITE_LOGS_TO_FILES
+      - DEBUG_MODE
+      # Additional Configuration
+      - NAMESPACE
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./logs:/app/logs
+  rate-limiter:
+    image: ${RATE_LIMITER_IMAGE:-ghcr.io/powerloom/rate-limiter:dockerify}
+    environment:
+      - DEFAULT_RATE_LIMIT=${DEFAULT_RATE_LIMIT:-1000}
+    command: poetry run uvicorn app:app --host 0.0.0.0 --port 8000
