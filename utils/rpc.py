@@ -757,7 +757,6 @@ class RpcHelper:
                     extra_info='RPC_GET_EVENT_LOGS_ERROR: Rate limit exceeded',
                 )
             node = self._nodes[node_idx]
-            rpc_url = node.get('rpc_url')
             web3_provider = node['web3_client']
 
             event_log_query = {
@@ -771,7 +770,11 @@ class RpcHelper:
                 codec: ABICodec = web3_provider.codec
                 all_events = []
                 for log in event_log:
-                    abi = event_abi.get(log.topics[0].hex(), '')
+                    key = log.topics[0].hex()
+                    # add 0x to the key if it is not already there
+                    if not key.startswith('0x'):
+                        key = '0x' + key
+                    abi = event_abi.get(key, '')
                     evt = get_event_data(codec, abi, log)
                     all_events.append(evt)
 
