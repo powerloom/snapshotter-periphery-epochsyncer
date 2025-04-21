@@ -54,7 +54,9 @@ class EpochEventDetector:
         # Configure Redis broker with minimal middleware
         self._broker = RedisBroker(
             host=self.settings.redis.host,
-            port=self.settings.redis.port
+            port=self.settings.redis.port,
+            password=self.settings.redis.password,
+            db=self.settings.redis.db,
         )
         self._broker.add_middleware(AsyncIO())
         
