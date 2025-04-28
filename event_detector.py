@@ -79,6 +79,7 @@ class EpochEventDetector:
         expected_block_txs_cache = dict()
         # boolean map of block number to status whether all tx hashes are cached
         expected_txs_cached_status = {block_num: False for block_num in range(event.args.begin, event.args.end + 1)}
+        count = 0
         try:
             while True:
                 if not blocks_cached:
