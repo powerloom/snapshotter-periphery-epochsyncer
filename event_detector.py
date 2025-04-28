@@ -182,6 +182,7 @@ class EpochEventDetector:
                         if last_processed_block_data:
                             self._last_processed_block = int(last_processed_block_data)
                             self.logger.info("Loaded last processed block from redis: {}", self._last_processed_block)
+                            first_run = False
                         else:
                             self._last_processed_block = current_block - 1
                             self.logger.info("Starting to listen from block {}", self._last_processed_block)
