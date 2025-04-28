@@ -6,3 +6,6 @@ def block_cache_key(namespace: str) -> str:
     """Key for sorted set storing cached block details."""
     return f'block_cache:{namespace}'
 
+
+def event_detector_last_processed_block(namespace: str) -> str:
+    return f'SystemEventDetector:lastProcessedBlock:{namespace}'
