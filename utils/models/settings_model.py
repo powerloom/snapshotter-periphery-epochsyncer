@@ -8,7 +8,6 @@ class RateLimitConfig(BaseModel):
 class RPCNodeConfig(BaseModel):
     """RPC node configuration model."""
     url: str
-    rate_limit: RateLimitConfig
 
 class ConnectionLimits(BaseModel):
     """Connection limits configuration model."""
@@ -16,15 +15,18 @@ class ConnectionLimits(BaseModel):
     max_keepalive_connections: int = 50
     keepalive_expiry: int = 300
 
-class RPCConfig(BaseModel):
-    """RPC configuration model."""
+class RPCConfigBase(BaseModel):
+    """Base RPC configuration model."""
     full_nodes: List[RPCNodeConfig]
     archive_nodes: Optional[List[RPCNodeConfig]]
     force_archive_blocks: Optional[int]
     retry: int
     request_time_out: int
     connection_limits: ConnectionLimits
-    polling_interval: float
+
+class RPCConfigFull(RPCConfigBase):
+    """Full RPC configuration model."""
+    polling_interval: int
     semaphore_value: int = 20
 
 class Logs(BaseModel):
@@ -42,8 +44,8 @@ class Redis(BaseModel):
 
 class Settings(BaseModel):
     """Main settings configuration model."""
-    source_rpc: RPCConfig
-    powerloom_rpc: RPCConfig
+    source_rpc: RPCConfigFull
+    powerloom_rpc: RPCConfigFull
     logs: Logs
     redis: Redis
     protocol_state_contract_address: str
