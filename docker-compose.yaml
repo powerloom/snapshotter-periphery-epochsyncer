@@ -25,7 +25,7 @@ services:
       - REDIS_DB
       - REDIS_PASSWORD
       - REDIS_SSL
-      - REDIS_CLUSTER
+      - REDIS_CLUSTER_MODE
       # Contract Configuration
       - PROTOCOL_STATE_CONTRACT_ADDRESS
       - DATA_MARKET_CONTRACT_ADDRESS
@@ -45,14 +45,42 @@ services:
       - ./logs:/app/logs
     depends_on:
       - rate-limiter
+      - redis
+  redis:
+    image: "redis:7-alpine"
+    command: redis-server --appendonly yes --port ${REDIS_PORT:-6379}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "redis-cli -h ${REDIS_HOST:-localhost} -p ${REDIS_PORT:-6379} ping | grep -q PONG && ! redis-cli -h ${REDIS_HOST:-localhost} -p ${REDIS_PORT:-6379} info persistence | grep -q 'loading:1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: on-failure
+    volumes:
+      - ./redis_data:/data
+    # Add optional password and memory configurations
+    environment:
+      - REDIS_PASSWORD
+      - REDIS_HOST
+    profiles:
+      - local
+      - test
+
   rate-limiter:
-    build:
-      context: rate-limiter
-      dockerfile: Dockerfile
+    image: ${RATE_LIMITER_IMAGE:-ghcr.io/powerloom/rate-limiter:dockerify}
     environment:
       - DEFAULT_RATE_LIMIT=${DEFAULT_RATE_LIMIT:-1000}
-    command: poetry run uvicorn app:app --host 0.0.0.0 --port 8000
-    restart: always
+    command: poetry run uvicorn app:app --host 0.0.0.0 --port ${RATE_LIMITER_PORT:-8000}
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000"]
+      test: ["CMD", "curl", "-f", "http://localhost:${RATE_LIMITER_PORT:-8000}/health"]
       interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - local
+      - test
+    env_file:
+      - .env
