@@ -2,10 +2,7 @@
   "source_rpc": {
     "full_nodes": [
       {
-        "url": "${SOURCE_RPC_URL}",
-        "rate_limit": {
-          "requests_per_second": "${SOURCE_RPC_RATE_LIMIT}"
-        }
+        "url": "${SOURCE_RPC_URL}"
       }
     ],
     "archive_nodes": null,
@@ -17,16 +14,12 @@
       "max_keepalive_connections": 50,
       "keepalive_expiry": 300
     },
-    "polling_interval": "${SOURCE_RPC_POLLING_INTERVAL}",
-    "semaphore_value": 20
+    "polling_interval": "${SOURCE_RPC_POLLING_INTERVAL}"
   },
   "powerloom_rpc": {
     "full_nodes": [
       {
-        "url": "${POWERLOOM_RPC_URL}",
-        "rate_limit": {
-          "requests_per_second": "${POWERLOOM_RPC_RATE_LIMIT}"
-        }
+        "url": "${POWERLOOM_RPC_URL}"
       }
     ],
     "archive_nodes": null,
@@ -38,8 +31,7 @@
       "max_keepalive_connections": 50,
       "keepalive_expiry": 300
     },
-    "polling_interval": "${POWERLOOM_RPC_POLLING_INTERVAL}",
-    "semaphore_value": 20
+    "polling_interval": "${POWERLOOM_RPC_POLLING_INTERVAL}"
   },
   "logs": {
     "write_to_files": "${WRITE_LOGS_TO_FILES}"

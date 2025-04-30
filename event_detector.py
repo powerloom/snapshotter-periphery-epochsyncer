@@ -7,7 +7,7 @@ from dramatiq.middleware.asyncio import AsyncIO
 from redis import asyncio as aioredis
 from utils.logging import logger, configure_file_logging
 from config.loader import get_core_config
-from utils.rpc import RpcHelper, get_event_sig_and_abi
+from rpc_helper.rpc import RpcHelper, get_event_sig_and_abi
 from utils.redis.redis_conn import RedisPool
 from utils.redis.redis_keys import block_cache_key, block_tx_htable_key, event_detector_last_processed_block
 from utils.models.message_models import EpochReleasedEvent
