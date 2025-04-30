@@ -127,7 +127,7 @@ class EpochEventDetector:
                 dramatiq.Message(
                     queue_name=self._event_detection_q,
                     actor_name='handleEvent',
-                    args=('EpochReleased', worker_epoch_released_event.model_dump_json()),
+                    args=('EpochReleased', worker_epoch_released_event.json()),
                     kwargs={},
                     options={},
                 ),
