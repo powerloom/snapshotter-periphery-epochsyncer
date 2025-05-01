@@ -1918,7 +1918,7 @@ web3 = "6.17.1"
 type = "git"
 url = "https://github.com/PowerLoom/rpc-helper.git"
 reference = "feat/dependency_update"
-resolved_reference = "e4f755207e0f2e33936d7cd8c36186c75f24a39d"
+resolved_reference = "34244cd4683404865980d1d6cf599def9b360bad"
 
 [[package]]
 name = "rpds-py"
