@@ -8,13 +8,13 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.12"
 web3 = "^6.17.1"
-pydantic = "^1.10.21"
+pydantic = "^2.11.3"
 python-dotenv = "^1.1.0"
 loguru = "^0.7.3"
-tenacity = "^8.2.2"
+tenacity = "^9.1.2"
 redis = "^5.2.1"
 dramatiq = "^1.17.1"
-rpc_helper = { git = "https://github.com/PowerLoom/rpc-helper.git"}
+rpc_helper = { git = "https://github.com/PowerLoom/rpc-helper.git", branch = "feat/dependency_update" }
 
 [build-system]
 requires = ["poetry-core"]
