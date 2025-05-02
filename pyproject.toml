@@ -14,7 +14,7 @@ loguru = "^0.7.3"
 tenacity = "^9.1.2"
 redis = "^5.2.1"
 dramatiq = "^1.17.1"
-rpc_helper = { git = "https://github.com/PowerLoom/rpc-helper.git", branch = "feat/dependency_update" }
+rpc_helper = { git = "https://github.com/PowerLoom/rpc-helper.git"}
 
 [build-system]
 requires = ["poetry-core"]
