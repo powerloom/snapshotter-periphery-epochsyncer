@@ -36,6 +36,7 @@ class EpochEventDetector:
             address=Web3.to_checksum_address(self.settings.protocol_state_contract_address),
             abi=self.protocol_state_abi,
         )
+        self.data_market_address = Web3.to_checksum_address(self.settings.data_market_contract_address)
 
         # Define event ABIs and signatures for monitoring
         EVENTS_ABI = {
@@ -117,22 +118,26 @@ class EpochEventDetector:
                     self.logger.warning("Timeout waiting for block and tx receipt cache in range {} to {}", event.args.begin, event.args.end)
                     return
             self.logger.info("✅ Block and tx receipt cache found in Redis in range {} to {}", event.args.begin, event.args.end)
-            worker_epoch_released_event = EpochReleasedEvent(
-                epochId=event.args.epochId,
-                begin=event.args.begin,
-                end=event.args.end,
-                timestamp=event.args.timestamp
-            )
-            dramatiq.broker.get_broker().enqueue(
-                dramatiq.Message(
-                    queue_name=self._event_detection_q,
-                    actor_name='handleEvent',
-                    args=('EpochReleased', worker_epoch_released_event.json()),
-                    kwargs={},
-                    options={},
-                ),
-            )
-            self.logger.info("✅ Sent message to handleEvent for epoch {} in range {} to {}", event.args.epochId, event.args.begin, event.args.end)
+            # check address is data market address
+            if event.args.dataMarketAddress == self.data_market_address:
+                worker_epoch_released_event = EpochReleasedEvent(
+                    epochId=event.args.epochId,
+                    begin=event.args.begin,
+                    end=event.args.end,
+                    timestamp=event.args.timestamp
+                )
+                dramatiq.broker.get_broker().enqueue(
+                    dramatiq.Message(
+                        queue_name=self._event_detection_q,
+                        actor_name='handleEvent',
+                        args=('EpochReleased', worker_epoch_released_event.json()),
+                        kwargs={},
+                        options={},
+                    ),
+                )
+                self.logger.info("✅ Sent message to handleEvent for epoch {} in range {} to {}", event.args.epochId, event.args.begin, event.args.end)
+            else:
+                self.logger.warning("Epoch released event data market address {} does not match expected data market address {}", event.args.dataMarketAddress, self.data_market_address)
             # Remove task from tracking
             if task_id in self._cache_check_tasks:
                 del self._cache_check_tasks[task_id]
