@@ -38,13 +38,14 @@ class EpochEventDetector:
         )
         self.data_market_address = Web3.to_checksum_address(self.settings.data_market_contract_address)
 
-        # Define event ABIs and signatures for monitoring
         EVENTS_ABI = {
             'EpochReleased': self.contract.events.EpochReleased._get_event_abi(),
+            'DayStartedEvent': self.contract.events.DayStartedEvent._get_event_abi(),
         }
 
         EVENT_SIGS = {
             'EpochReleased': 'EpochReleased(address,uint256,uint256,uint256,uint256)',
+            'DayStartedEvent': 'DayStartedEvent(address,uint256,uint256)',
         }
 
         self.event_sig, self.event_abi = get_event_sig_and_abi(
@@ -158,27 +159,46 @@ class EpochEventDetector:
         )
         
         for event in events:
-            self.logger.info(
-                "Epoch Released - DataMarket: {}, EpochId: {}, Begin: {}, End: {}, Timestamp: {}",
-                event.args.dataMarketAddress,
-                event.args.epochId,
-                event.args.begin,
-                event.args.end,
-                event.args.timestamp
-            )
-            
-            # # Start background task to check cache and send message when ready
-            task_id = f"{event.args.epochId}_{event.args.begin}_{event.args.end}"
-            if task_id not in self._cache_check_tasks:
-                self._cache_check_tasks[task_id] = asyncio.create_task(
-                    self._check_cache_and_send(event, polling_interval=1)
+            if event.event == 'DayStartedEvent':
+                self.logger.info(
+                    "Day Started - DataMarket: {}, DayId: {}, Timestamp: {}",
+                    event.args.dataMarketAddress,
+                    event.args.dayId,
+                    event.args.timestamp
                 )
+                # set current day in redis
+                await self._redis.set(
+                    "current_day",
+                    str(event.args.dayId),
+                )
+            else:
+                self.logger.info(
+                    "Epoch Released - DataMarket: {}, EpochId: {}, Begin: {}, End: {}, Timestamp: {}",
+                    event.args.dataMarketAddress,
+                    event.args.epochId,
+                    event.args.begin,
+                    event.args.end,
+                    event.args.timestamp
+                )
+                
+                # # Start background task to check cache and send message when ready
+                task_id = f"{event.args.epochId}_{event.args.begin}_{event.args.end}"
+                if task_id not in self._cache_check_tasks:
+                    self._cache_check_tasks[task_id] = asyncio.create_task(
+                        self._check_cache_and_send(event, polling_interval=1)
+                    )
             
         return events
 
     async def detect_events(self):
         first_run = True
         """Main event detection loop"""
+        current_day = await self.contract.functions.dayCounter(self.data_market_address).call()
+        # set current day in redis
+        await self._redis.set(
+            "current_day",
+            str(current_day),
+        )
         try:
             while True:
                 try:
