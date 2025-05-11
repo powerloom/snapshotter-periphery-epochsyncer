@@ -10,7 +10,7 @@ from config.loader import get_core_config
 from rpc_helper.rpc import RpcHelper, get_event_sig_and_abi
 from utils.redis.redis_conn import RedisPool
 from utils.redis.redis_keys import block_cache_key, block_tx_htable_key, event_detector_last_processed_block
-from utils.models.message_models import EpochReleasedEvent
+from utils.models.message_models import EpochReleasedEvent, SnapshotBatchSubmittedEvent
 
 class EpochEventDetector:
     _redis: aioredis.Redis
@@ -41,11 +41,13 @@ class EpochEventDetector:
         EVENTS_ABI = {
             'EpochReleased': self.contract.events.EpochReleased._get_event_abi(),
             'DayStartedEvent': self.contract.events.DayStartedEvent._get_event_abi(),
+            'SnapshotBatchSubmitted': self.contract.events.SnapshotBatchSubmitted._get_event_abi(),
         }
 
         EVENT_SIGS = {
             'EpochReleased': 'EpochReleased(address,uint256,uint256,uint256,uint256)',
             'DayStartedEvent': 'DayStartedEvent(address,uint256,uint256)',
+            'SnapshotBatchSubmitted': 'SnapshotBatchSubmitted(address,string,uint256,uint256)',
         }
 
         self.event_sig, self.event_abi = get_event_sig_and_abi(
@@ -147,6 +149,35 @@ class EpochEventDetector:
             if task_id in self._cache_check_tasks:
                 del self._cache_check_tasks[task_id]
 
+
+    async def _handle_snapshot_batch_submitted(self, event):
+        self.logger.info(f"Handling snapshot batch submitted event: {event}")
+        self.logger.info(f"Comparing data market addresses - Event: {event.args.dataMarketAddress}, Expected: {self.data_market_address}")
+        if event.args.dataMarketAddress == self.data_market_address:
+            try:
+                worker_snapshot_batch_submitted_event = SnapshotBatchSubmittedEvent(
+                    epochId=event.args.epochId,
+                    batchCid=event.args.batchCid,
+                    timestamp=event.args.timestamp,
+                    transactionHash=event.transactionHash.hex()
+                )
+                self.logger.info(f"Created event object: {worker_snapshot_batch_submitted_event}")
+                dramatiq.broker.get_broker().enqueue(
+                    dramatiq.Message(
+                            queue_name=self._event_detection_q,
+                            actor_name='handleEvent',
+                            args=('SnapshotBatchSubmitted', worker_snapshot_batch_submitted_event.model_dump_json()),
+                            kwargs={},
+                            options={}
+                        ),
+                    )
+                self.logger.info("✅ Sent message to handleEvent for snapshot batch {} in epoch {}", event.args.batchCid, event.args.epochId)
+            except Exception as e:
+                self.logger.error("Error in snapshot batch submitted event: {}", str(e))
+                self.logger.exception("Full traceback:")
+        else:
+            self.logger.warning("Data market address mismatch - Event: {}, Expected: {}", event.args.dataMarketAddress, self.data_market_address)
+
     async def get_events(self, from_block: int, to_block: int):
         """Get EpochReleased events in block range"""
         self.logger.info("Getting events from block {} to block {}", from_block, to_block)
@@ -171,6 +202,16 @@ class EpochEventDetector:
                     "current_day",
                     str(event.args.dayId),
                 )
+            elif event.event == 'SnapshotBatchSubmitted':
+                self.logger.info(
+                    "Snapshot Batch Submitted - DataMarket: {}, EpochId: {}, BatchCid: {}, Timestamp: {}, TransactionHash: {}",
+                    event.args.dataMarketAddress,
+                    event.args.epochId,
+                    event.args.batchCid,
+                    event.args.timestamp,
+                    event.transactionHash.hex()
+                )
+                await self._handle_snapshot_batch_submitted(event)
             else:
                 self.logger.info(
                     "Epoch Released - DataMarket: {}, EpochId: {}, Begin: {}, End: {}, Timestamp: {}",
@@ -191,6 +232,7 @@ class EpochEventDetector:
         return events
 
     async def detect_events(self):
+        self.logger.info("Starting event detection test test")
         first_run = True
         """Main event detection loop"""
         current_day = await self.contract.functions.dayCounter(self.data_market_address).call()
