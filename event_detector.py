@@ -212,7 +212,7 @@ class EpochEventDetector:
                     event.transactionHash.hex()
                 )
                 await self._handle_snapshot_batch_submitted(event)
-            else:
+            elif event.event == 'EpochReleased':
                 self.logger.info(
                     "Epoch Released - DataMarket: {}, EpochId: {}, Begin: {}, End: {}, Timestamp: {}",
                     event.args.dataMarketAddress,
