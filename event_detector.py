@@ -117,7 +117,7 @@ class EpochEventDetector:
                     break
                 await asyncio.sleep(polling_interval)
                 count += 1
-                if count > 30:
+                if count > 60:
                     self.logger.warning("Timeout waiting for block and tx receipt cache in range {} to {}", event.args.begin, event.args.end)
                     return
             self.logger.info("✅ Block and tx receipt cache found in Redis in range {} to {}", event.args.begin, event.args.end)
