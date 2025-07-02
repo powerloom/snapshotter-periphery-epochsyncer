@@ -1,0 +1,4279 @@
+Directory structure:
+└── snapshotter-periphery-epochsyncer/
+    ├── README.md
+    ├── build_and_run.sh
+    ├── docker-compose.yaml
+    ├── Dockerfile
+    ├── env.example
+    ├── event_detector.py
+    ├── pyproject.toml
+    ├── .python-version
+    ├── config/
+    │   ├── loader.py
+    │   └── settings.template.json
+    ├── rate-limiter/
+    │   ├── README.md
+    │   ├── app.py
+    │   ├── Dockerfile
+    │   └── pyproject.toml
+    ├── scripts/
+    │   ├── entrypoint.py
+    │   └── generate_settings_template.py
+    └── utils/
+        ├── logging.py
+        ├── abi/
+        │   └── ProtocolContract.json
+        ├── models/
+        │   ├── message_models.py
+        │   └── settings_model.py
+        └── redis/
+            ├── redis_conn.py
+            └── redis_keys.py
+
+================================================
+FILE: README.md
+================================================
+# snapshotter-periphery-epochsyncer
+
+A service that monitors and synchronizes epoch events from the blockchain, ensuring block and transaction data is cached before forwarding events to downstream workers.
+
+## Components
+
+The service consists of two main components:
+
+1. **EpochSyncer Service**
+   - Monitors blockchain for epoch release events
+   - Checks Redis cache for block and transaction data availability
+   - Uses Dramatiq to send messages to downstream workers when data is ready
+   - Configurable RPC endpoints and rate limiting
+   - Detailed logging and monitoring
+
+2. **Rate Limiter Service**
+   - Provides rate limiting for RPC calls
+   - REST API endpoint for rate limit management
+   - Health check monitoring
+   - Configurable default rate limits
+
+## Architecture
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│                 │     │                 │     │                 │
+│  Blockchain RPC │◄────┤  EpochSyncer    │◄────┤  Rate Limiter   │
+│                 │     │                 │     │                 │
+└─────────────────┘     └────────┬────────┘     └─────────────────┘
+                                 │
+                                 ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│                 │     │                 │     │                 │
+│  Redis Cache    │◄────┤  Cache Checker  │     │  Dramatiq       │
+│                 │     │  (Background)   │     │  Workers        │
+└─────────────────┘     └────────┬────────┘     └─────────────────┘
+                                 │
+                                 ▼
+┌─────────────────┐
+│                 │
+│  Downstream     │
+│  Workers        │
+│                 │
+└─────────────────┘
+```
+
+## Features
+
+- **Event Detection**: Monitors blockchain for epoch release events
+- **Cache Verification**: 
+  - Checks Redis for block data availability
+  - Verifies transaction data in Redis hash tables
+  - Background tasks for continuous cache checking
+- **Message Queue**: Uses Dramatiq for reliable message delivery
+- **Rate Limiting**: Integrated rate limiting for RPC calls
+- **Configurable**: Extensive environment variable configuration
+- **Logging**: Comprehensive logging with rotation and retention
+
+## Environment Variables
+
+See `env.example` for all configurable environment variables.
+
+## Running the Service
+
+```bash
+docker-compose up -d
+```
+
+## Health Checks
+
+- Rate Limiter: `http://localhost:8000`
+- EpochSyncer: Monitored through logs and Dramatiq queue status
+
+
+
+================================================
+FILE: build_and_run.sh
+================================================
+
+docker-compose up --build
+
+
+================================================
+FILE: docker-compose.yaml
+================================================
+version: '3.8'
+
+services:
+  epochsyncer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: epochsyncer
+    environment:
+      # Source RPC Configuration
+      - SOURCE_RPC_URL
+      - SOURCE_RPC_RATE_LIMIT
+      - SOURCE_RPC_MAX_RETRIES
+      - SOURCE_RPC_TIMEOUT
+      - SOURCE_RPC_POLLING_INTERVAL
+      # Powerloom RPC Configuration
+      - POWERLOOM_RPC_URL
+      - POWERLOOM_RPC_RATE_LIMIT
+      - POWERLOOM_RPC_RETRY
+      - POWERLOOM_RPC_TIMEOUT
+      - POWERLOOM_RPC_POLLING_INTERVAL
+      # Redis Configuration
+      - REDIS_HOST
+      - REDIS_PORT
+      - REDIS_DB
+      - REDIS_PASSWORD
+      - REDIS_SSL
+      - REDIS_CLUSTER_MODE
+      # Contract Configuration
+      - PROTOCOL_STATE_CONTRACT_ADDRESS
+      - DATA_MARKET_CONTRACT_ADDRESS
+      # Application Configuration
+      - POLLING_INTERVAL
+      # Logging Configuration
+      - LOG_LEVEL
+      - LOG_FILE_PATH
+      - LOG_ROTATION
+      - LOG_RETENTION
+      - WRITE_LOGS_TO_FILES
+      - DEBUG_MODE
+      # Additional Configuration
+      - NAMESPACE
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - rate-limiter
+      - redis
+  redis:
+    image: "redis:7-alpine"
+    command: redis-server --appendonly yes --port ${REDIS_PORT:-6379}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "redis-cli -h ${REDIS_HOST:-localhost} -p ${REDIS_PORT:-6379} ping | grep -q PONG && ! redis-cli -h ${REDIS_HOST:-localhost} -p ${REDIS_PORT:-6379} info persistence | grep -q 'loading:1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: on-failure
+    volumes:
+      - ./redis_data:/data
+    # Add optional password and memory configurations
+    environment:
+      - REDIS_PASSWORD
+      - REDIS_HOST
+    profiles:
+      - local
+      - test
+
+  rate-limiter:
+    image: ${RATE_LIMITER_IMAGE:-ghcr.io/powerloom/rate-limiter:dockerify}
+    environment:
+      - DEFAULT_RATE_LIMIT=${DEFAULT_RATE_LIMIT:-1000}
+    command: poetry run uvicorn app:app --host 0.0.0.0 --port ${RATE_LIMITER_PORT:-8000}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${RATE_LIMITER_PORT:-8000}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - local
+      - test
+    env_file:
+      - .env
+
+
+================================================
+FILE: Dockerfile
+================================================
+FROM python:3.12-slim
+
+# Install system dependencies
+RUN apt-get update && \
+    apt-get install -y gcc build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Install Poetry
+RUN pip install poetry
+
+# Copy dependency files
+COPY pyproject.toml poetry.lock ./
+
+# Configure Poetry to not create virtual environment in container
+RUN poetry config virtualenvs.create false
+
+# Install dependencies
+RUN poetry install --no-root
+
+# Create logs directory
+RUN mkdir logs
+
+# Copy application code
+COPY . .
+
+# Make entrypoint script executable
+RUN chmod +x scripts/entrypoint.py
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+
+# Use entrypoint script to configure and start the service
+CMD ["python", "scripts/entrypoint.py"]
+
+
+
+================================================
+FILE: env.example
+================================================
+# Source RPC (Ethereum Mainnet) Configuration
+SOURCE_RPC_URL=https://eth-mainnet.example.com
+SOURCE_RPC_TIMEOUT=30
+SOURCE_RPC_MAX_RETRIES=3
+SOURCE_RPC_RETRY_DELAY=1
+SOURCE_RPC_RATE_LIMIT=100
+SOURCE_RPC_POLLING_INTERVAL=5
+
+# Powerloom RPC Configuration
+POWERLOOM_RPC_URL=http://your-powerloom-rpc-url
+POWERLOOM_RPC_RATE_LIMIT=100
+POWERLOOM_RPC_RETRY=3
+POWERLOOM_RPC_TIMEOUT=30
+POWERLOOM_RPC_POLLING_INTERVAL=1
+
+# Redis Configuration
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_DB=0
+REDIS_PASSWORD=
+REDIS_SSL=false
+REDIS_CLUSTER_MODE=false
+
+# Contract Configuration
+PROTOCOL_STATE_CONTRACT_ADDRESS=0x...
+DATA_MARKET_CONTRACT_ADDRESS=0x21cb57C1f2352ad215a463DD867b838749CD3b8f
+
+
+# Logging Configuration
+WRITE_LOGS_TO_FILES=true
+
+
+# Additional Configuration
+NAMESPACE=UNISWAPV2
+INSTANCE_ID=0x....
+
+
+# Rate Limiter Configuration
+RATE_LIMITER_IMAGE=rate-limiter
+RATE_LIMITER_PORT=8000
+DEFAULT_RATE_LIMIT=1000
+
+
+================================================
+FILE: event_detector.py
+================================================
+import asyncio
+import json
+import dramatiq
+from web3 import Web3
+from dramatiq.brokers.redis import RedisBroker
+from dramatiq.middleware.asyncio import AsyncIO
+from redis import asyncio as aioredis
+from utils.logging import logger, configure_file_logging
+from config.loader import get_core_config
+from rpc_helper.rpc import RpcHelper, get_event_sig_and_abi
+from utils.redis.redis_conn import RedisPool
+from utils.redis.redis_keys import block_cache_key, block_tx_htable_key, event_detector_last_processed_block
+from utils.models.message_models import EpochReleasedEvent, SnapshotBatchSubmittedEvent
+
+class EpochEventDetector:
+    _redis: aioredis.Redis
+    _broker: RedisBroker
+    _cache_check_tasks: dict[str, asyncio.Task]
+    _last_processed_block: int
+    def __init__(self):
+        self.settings = get_core_config()
+        self._powerloom_rpc_helper = RpcHelper(self.settings.powerloom_rpc)
+        self.logger = logger.bind(module='EpochEventDetector')
+        self._cache_check_tasks = {}
+        with open('utils/abi/ProtocolContract.json', 'r') as f:
+            self.protocol_state_abi = json.load(f)
+        self._event_detection_q = f'powerloom-event-detector_{self.settings.namespace}_{self.settings.instance_id}'
+        
+
+    async def init(self):
+        self._last_processed_block = 0
+        """Initialize RPC connection"""
+        await self._powerloom_rpc_helper.init()
+        # Set up the contract and event ABIs
+        self.contract = self._powerloom_rpc_helper.get_current_node()['web3_client'].eth.contract(
+            address=Web3.to_checksum_address(self.settings.protocol_state_contract_address),
+            abi=self.protocol_state_abi,
+        )
+        self.data_market_address = Web3.to_checksum_address(self.settings.data_market_contract_address)
+
+        EVENTS_ABI = {
+            'EpochReleased': self.contract.events.EpochReleased._get_event_abi(),
+            'DayStartedEvent': self.contract.events.DayStartedEvent._get_event_abi(),
+            'SnapshotBatchSubmitted': self.contract.events.SnapshotBatchSubmitted._get_event_abi(),
+        }
+
+        EVENT_SIGS = {
+            'EpochReleased': 'EpochReleased(address,uint256,uint256,uint256,uint256)',
+            'DayStartedEvent': 'DayStartedEvent(address,uint256,uint256)',
+            'SnapshotBatchSubmitted': 'SnapshotBatchSubmitted(address,string,uint256,uint256)',
+        }
+
+        self.event_sig, self.event_abi = get_event_sig_and_abi(
+            EVENT_SIGS,
+            EVENTS_ABI,
+        )
+        self._redis = await RedisPool.get_pool()
+        # Configure Redis broker with minimal middleware
+        self._broker = RedisBroker(
+            host=self.settings.redis.host,
+            port=self.settings.redis.port,
+            password=self.settings.redis.password,
+            db=self.settings.redis.db,
+        )
+        self._broker.add_middleware(AsyncIO())
+        
+        # Remove Prometheus middleware to avoid errors
+        middleware = self._broker.middleware[:]  # Make a copy
+        for m in middleware:
+            if m.__class__.__name__ == 'Prometheus':
+                self._broker.middleware.remove(m)
+        
+        dramatiq.set_broker(self._broker)
+
+    async def _check_cache_and_send(self, event, polling_interval: int = 1):
+        """
+        Background task to check cache availability and send message when ready
+        """
+        task_id = f"{event.args.epochId}_{event.args.begin}_{event.args.end}"
+        blocks_cached = False
+        block_txs_cached = False
+        # map block number to list of tx hashes
+        expected_block_txs_cache = dict()
+        # boolean map of block number to status whether all tx hashes are cached
+        expected_txs_cached_status = {block_num: False for block_num in range(event.args.begin, event.args.end + 1)}
+        count = 0
+        try:
+            while True:
+                if not blocks_cached:
+                    cached_blocks_zset = block_cache_key(self.settings.namespace)
+                    block_details = await self._redis.zrangebyscore(
+                        name=cached_blocks_zset, 
+                        min=event.args.begin, 
+                        max=event.args.end, 
+                        withscores=True,
+                        score_cast_func=int
+                    )
+                    
+                    value_scores = {x[1] for x in block_details}
+                    for block_deets, block_num in block_details:
+                        expected_block_txs_cache.update({int(block_num): json.loads(block_deets)['transactions']})
+                    if all(block_num in value_scores for block_num in range(event.args.begin, event.args.end + 1)):
+                        self.logger.info("✅ Block cache found in Redis in range {} to {}", event.args.begin, event.args.end)
+                        blocks_cached = True
+                else:
+                    self.logger.info("Waiting for blocks in range {} to {} to be cached", event.args.begin, event.args.end)
+                if not block_txs_cached:
+                    for block_num in range(event.args.begin, event.args.end + 1):
+                        if block_num in expected_block_txs_cache:
+                            block_htable_txs_cached = await self._redis.hkeys(block_tx_htable_key(self.settings.namespace, block_num))
+                            self.logger.info('Checking {} keys in block {} txs htable cache against expected {} txs', len(block_htable_txs_cached), block_num, len(expected_block_txs_cache[block_num]))
+                            expected_txs_cached_status[block_num] = all(tx_hash in block_htable_txs_cached for tx_hash in expected_block_txs_cache[block_num])
+                    if all(expected_txs_cached_status.values()):
+                        self.logger.info("✅ All txs cached in block range {} to {}", event.args.begin, event.args.end)
+                        block_txs_cached = True
+                if blocks_cached and block_txs_cached:
+                    break
+                await asyncio.sleep(polling_interval)
+                count += 1
+                if count > 60:
+                    self.logger.warning("Timeout waiting for block and tx receipt cache in range {} to {}", event.args.begin, event.args.end)
+                    return
+            self.logger.info("✅ Block and tx receipt cache found in Redis in range {} to {}", event.args.begin, event.args.end)
+            # check address is data market address
+            worker_epoch_released_event = EpochReleasedEvent(
+                epochId=event.args.epochId,
+                begin=event.args.begin,
+                end=event.args.end,
+                timestamp=event.args.timestamp
+            )
+            dramatiq.broker.get_broker().enqueue(
+                dramatiq.Message(
+                    queue_name=self._event_detection_q,
+                    actor_name='handleEvent',
+                    args=('EpochReleased', worker_epoch_released_event.json()),
+                    kwargs={},
+                    options={},
+                ),
+            )
+            self.logger.info("✅ Sent message to handleEvent for epoch {} in range {} to {}", event.args.epochId, event.args.begin, event.args.end)
+            # Remove task from tracking
+            if task_id in self._cache_check_tasks:
+                del self._cache_check_tasks[task_id]
+        except Exception as e:
+            self.logger.error("Error in cache checking task: {}", str(e))
+            if task_id in self._cache_check_tasks:
+                del self._cache_check_tasks[task_id]
+
+    async def _handle_snapshot_batch_submitted(self, event):
+        self.logger.info(f"Handling snapshot batch submitted event: {event}")
+        self.logger.info(f"Comparing data market addresses - Event: {event.args.dataMarketAddress}, Expected: {self.data_market_address}")
+        try:
+            worker_snapshot_batch_submitted_event = SnapshotBatchSubmittedEvent(
+                epochId=event.args.epochId,
+                batchCid=event.args.batchCid,
+                timestamp=event.args.timestamp,
+                transactionHash=event.transactionHash.hex()
+            )
+            self.logger.info(f"Created event object: {worker_snapshot_batch_submitted_event}")
+            dramatiq.broker.get_broker().enqueue(
+                dramatiq.Message(
+                        queue_name=self._event_detection_q,
+                        actor_name='handleEvent',
+                        args=('SnapshotBatchSubmitted', worker_snapshot_batch_submitted_event.model_dump_json()),
+                        kwargs={},
+                        options={}
+                    ),
+                )
+            self.logger.info("✅ Sent message to handleEvent for snapshot batch {} in epoch {}", event.args.batchCid, event.args.epochId)
+        except Exception as e:
+            self.logger.error("Error in snapshot batch submitted event: {}", str(e))
+            self.logger.exception("Full traceback:")
+
+    async def get_events(self, from_block: int, to_block: int):
+        """Get EpochReleased events in block range"""
+        self.logger.info("Getting events from block {} to block {}", from_block, to_block)
+        events = await self._powerloom_rpc_helper.get_events_logs(
+            contract_address=self.contract.address,
+            to_block=to_block,
+            from_block=from_block,
+            topics=[self.event_sig],
+            event_abi=self.event_abi
+        )
+        
+        for event in events:
+            if event.args.dataMarketAddress != self.data_market_address:
+                self.logger.warning("Data market address {} does not match expected data market address {}", event.args.dataMarketAddress, self.data_market_address)
+                continue
+
+            if event.event == 'DayStartedEvent':
+                self.logger.info(
+                    "Day Started - DataMarket: {}, DayId: {}, Timestamp: {}",
+                    event.args.dataMarketAddress,
+                    event.args.dayId,
+                    event.args.timestamp
+                )
+                # set current day in redis
+                await self._redis.set(
+                    "current_day",
+                    str(event.args.dayId),
+                )
+            elif event.event == 'SnapshotBatchSubmitted':
+                self.logger.info(
+                    "Snapshot Batch Submitted - DataMarket: {}, EpochId: {}, BatchCid: {}, Timestamp: {}, TransactionHash: {}",
+                    event.args.dataMarketAddress,
+                    event.args.epochId,
+                    event.args.batchCid,
+                    event.args.timestamp,
+                    event.transactionHash.hex()
+                )
+                await self._handle_snapshot_batch_submitted(event)
+            elif event.event == 'EpochReleased':
+                self.logger.info(
+                    "Epoch Released - DataMarket: {}, EpochId: {}, Begin: {}, End: {}, Timestamp: {}",
+                    event.args.dataMarketAddress,
+                    event.args.epochId,
+                    event.args.begin,
+                    event.args.end,
+                    event.args.timestamp
+                )
+                
+                # # Start background task to check cache and send message when ready
+                task_id = f"{event.args.epochId}_{event.args.begin}_{event.args.end}"
+                if task_id not in self._cache_check_tasks:
+                    self._cache_check_tasks[task_id] = asyncio.create_task(
+                        self._check_cache_and_send(event, polling_interval=1)
+                    )
+            
+        return events
+
+    async def detect_events(self):
+        self.logger.info("Starting event detection test test")
+        first_run = True
+        """Main event detection loop"""
+        current_day = await self.contract.functions.dayCounter(self.data_market_address).call()
+        # set current day in redis
+        await self._redis.set(
+            "current_day",
+            str(current_day),
+        )
+        try:
+            while True:
+                try:
+                    current_block = await self._powerloom_rpc_helper.get_current_block_number()
+                    
+                    if not self._last_processed_block:
+                        last_processed_block_data = await self._redis.get(
+                            event_detector_last_processed_block(self.settings.namespace),
+                        )
+
+                        if last_processed_block_data:
+                            self._last_processed_block = int(last_processed_block_data)
+                            self.logger.info("Loaded last processed block from redis: {}", self._last_processed_block)
+                            first_run = False
+                        else:
+                            self._last_processed_block = current_block - 1
+                            self.logger.info("Starting to listen from block {}", self._last_processed_block)
+                    
+                    if current_block > self._last_processed_block:
+                        if current_block - self._last_processed_block >= 10:
+                            self.logger.warning("Last processed block is too far behind current block, processing from {} to {}", self._last_processed_block + 1, current_block)
+                            self._last_processed_block = current_block - 10
+                        # Get events from last processed to current
+                        await self.get_events(
+                            from_block=self._last_processed_block + 1 if not first_run else self._last_processed_block,
+                            to_block=current_block
+                        )
+                        self._last_processed_block = current_block
+                        await self._redis.set(
+                            event_detector_last_processed_block(self.settings.namespace),
+                            str(self._last_processed_block),
+                        )
+                    
+                    # Wait before next check
+                    first_run = False
+                    await asyncio.sleep(self.settings.powerloom_rpc.polling_interval)
+
+                except Exception as e:
+                    self.logger.opt(exception=True).error("Error processing events: {}", str(e))
+                    
+                    await asyncio.sleep(5)  # Wait before retrying
+                    raise e
+
+        except Exception as e:
+            self.logger.error("Fatal error in event listener: {}", str(e))
+            raise
+
+
+async def main():
+    # Configure logging
+    configure_file_logging()
+    
+    # Create and start detector
+    detector = EpochEventDetector()
+    await detector.init()
+    await detector.detect_events()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+================================================
+FILE: pyproject.toml
+================================================
+[tool.poetry]
+name = "snapshotter-periphery-epochsyncer"
+version = "0.1.0"
+description = "releases epochs to snapshotter-core workers when preloads are satisfied"
+authors = ["Anomit <anomit@powerloom.io>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+web3 = "^6.17.1"
+pydantic = "^2.11.3"
+python-dotenv = "^1.1.0"
+loguru = "^0.7.3"
+tenacity = "^9.1.2"
+redis = "^5.2.1"
+dramatiq = "^1.17.1"
+rpc_helper = { git = "https://github.com/PowerLoom/rpc-helper.git"}
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+
+
+================================================
+FILE: .python-version
+================================================
+epochsync-312
+
+
+
+================================================
+FILE: config/loader.py
+================================================
+import os
+import json
+from functools import lru_cache
+from pathlib import Path
+from utils.models.settings_model import Settings
+from utils.logging import logger
+
+CONFIG_DIR = os.path.dirname(__file__)
+SETTINGS_FILE = os.path.join(CONFIG_DIR, 'settings.json')
+
+_logger = logger.bind(module='ConfigLoader')
+
+@lru_cache()
+def get_core_config() -> Settings:
+    """Load settings from the settings.json file."""
+    _logger.info(f"📖 Loading settings from: {SETTINGS_FILE}")
+    if not os.path.exists(SETTINGS_FILE):
+        _logger.error(f"❌ Settings file not found at {SETTINGS_FILE}")
+        raise RuntimeError(f"Settings file not found at {SETTINGS_FILE}. Ensure the entrypoint script has run.")
+    try:
+        with open(SETTINGS_FILE, 'r') as f:
+            settings_dict = json.load(f)
+        settings = Settings(**settings_dict)
+        _logger.success("✅ Successfully loaded settings")
+        return settings
+    except json.JSONDecodeError as e:
+        _logger.error(f"❌ Error decoding settings file: {e}")
+        raise RuntimeError(f"Error decoding settings file ({SETTINGS_FILE}): {str(e)}")
+    except Exception as e:
+        _logger.error(f"❌ Error loading settings: {e}")
+        raise RuntimeError(f"Error loading settings from {SETTINGS_FILE}: {str(e)}")
+
+
+
+================================================
+FILE: config/settings.template.json
+================================================
+{
+  "source_rpc": {
+    "full_nodes": [
+      {
+        "url": "${SOURCE_RPC_URL}"
+      }
+    ],
+    "archive_nodes": null,
+    "force_archive_blocks": null,
+    "retry": "${SOURCE_RPC_MAX_RETRIES}",
+    "request_time_out": "${SOURCE_RPC_TIMEOUT}",
+    "connection_limits": {
+      "max_connections": 100,
+      "max_keepalive_connections": 50,
+      "keepalive_expiry": 300
+    },
+    "polling_interval": "${SOURCE_RPC_POLLING_INTERVAL}"
+  },
+  "powerloom_rpc": {
+    "full_nodes": [
+      {
+        "url": "${POWERLOOM_RPC_URL}"
+      }
+    ],
+    "archive_nodes": null,
+    "force_archive_blocks": null,
+    "retry": "${POWERLOOM_RPC_RETRY}",
+    "request_time_out": "${POWERLOOM_RPC_TIMEOUT}",
+    "connection_limits": {
+      "max_connections": 100,
+      "max_keepalive_connections": 50,
+      "keepalive_expiry": 300
+    },
+    "polling_interval": "${POWERLOOM_RPC_POLLING_INTERVAL}"
+  },
+  "logs": {
+    "write_to_files": "${WRITE_LOGS_TO_FILES}"
+  },
+  "redis": {
+    "host": "${REDIS_HOST}",
+    "port": "${REDIS_PORT}",
+    "db": "${REDIS_DB}",
+    "password": "${REDIS_PASSWORD}",
+    "ssl": "${REDIS_SSL}",
+    "cluster_mode": "${REDIS_CLUSTER_MODE}"
+  },
+  "protocol_state_contract_address": "${PROTOCOL_STATE_CONTRACT_ADDRESS}",
+  "data_market_contract_address": "${DATA_MARKET_CONTRACT_ADDRESS}",
+  "namespace": "${NAMESPACE}",
+  "instance_id": "${INSTANCE_ID}"
+}
+
+
+================================================
+FILE: rate-limiter/README.md
+================================================
+# Rate Limiter Service
+
+A lightweight rate limiting service that supports multiple rate limits for different keys and tracks usage statistics.
+
+## Features
+
+- **Multiple Rate Limits**: Configure different rate limits for different keys
+- **Statistics Tracking**: Track hourly and daily usage for each key
+- **In-Memory Storage**: Simple in-memory storage for both rate limits and statistics
+- **Health Checks**: Endpoint to verify service health
+
+## API Endpoints
+
+### Check Rate Limit
+
+```
+GET /check/{key}
+```
+
+Checks if a key is within its rate limit. Returns:
+- `200 OK` if within rate limit
+- `429 Too Many Requests` if rate limit exceeded
+
+Example response:
+```json
+{
+  "status": "ok",
+  "key": "example-key",
+  "rate_limit": "10/second",
+  "timestamp": "2023-05-01T12:34:56.789012"
+}
+```
+
+### Configure Rate Limit
+
+```
+POST /configure
+```
+
+Configure a custom rate limit for a key.
+
+Request body:
+```json
+{
+  "key": "example-key",
+  "limit": "100/minute"
+}
+```
+
+Response:
+```json
+{
+  "status": "ok",
+  "key": "example-key",
+  "rate_limit": "100/minute"
+}
+```
+
+### Get Statistics
+
+```
+GET /stats/{key}
+```
+
+Get hourly and daily usage statistics for a key.
+
+Example response:
+```json
+{
+  "key": "example-key",
+  "hourly_calls": {
+    "2023-05-01-12": 45,
+    "2023-05-01-11": 23
+  },
+  "daily_calls": {
+    "2023-05-01": 152,
+    "2023-04-30": 89
+  },
+  "current_rate_limit": "100/minute"
+}
+```
+
+### Health Check
+
+```
+GET /health
+```
+
+Check the health of the service.
+
+Example response:
+```json
+{
+  "status": "ok",
+  "timestamp": "2023-05-01T12:34:56.789012"
+}
+```
+
+## Environment Variables
+
+- `DEFAULT_RATE_LIMIT`: Default rate limit (e.g., "10/second")
+- `PORT`: Port to run the service on (default: 8000)
+
+## Running the Service
+
+### Using Docker
+
+```bash
+docker build -t rate-limiter .
+docker run -p 8000:8000 rate-limiter
+```
+
+### Using Python
+
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+## Rate Limit Format
+
+Rate limits should be specified in the format `{number}/{unit}` where:
+- `number`: A positive integer
+- `unit`: One of "second", "minute", "hour", "day"
+
+Examples:
+- "10/second"
+- "100/minute"
+- "1000/hour"
+- "5000/day"
+
+## Important Notes
+
+This service uses in-memory storage, which means all rate limits and statistics will be lost when the service restarts. This is suitable for development and testing environments, but for production use cases requiring persistence, consider implementing a database backend.
+
+
+
+================================================
+FILE: rate-limiter/app.py
+================================================
+import os
+from collections import defaultdict
+from datetime import datetime
+from datetime import timedelta
+from typing import Dict
+
+from dotenv import load_dotenv
+from fastapi import Depends
+from fastapi import FastAPI
+from fastapi import Request
+from pydantic import BaseModel
+from slowapi import _rate_limit_exceeded_handler
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Configuration
+# Default rate limit if not specified in environment or for a specific key
+RATE_LIMIT = os.getenv('DEFAULT_RATE_LIMIT', '10')
+
+DEFAULT_RATE_LIMIT = f'{RATE_LIMIT}/second'
+
+print(f'DEFAULT_RATE_LIMIT: {DEFAULT_RATE_LIMIT}')
+
+# Initialize FastAPI app with title
+app = FastAPI(title='Rate Limiter')
+
+# In-memory statistics storage
+# Format: {key: {'hourly': {timestamp: count}, 'daily': {timestamp: count}}}
+# This stores usage statistics for each key, organized by hour and day
+stats_storage = defaultdict(lambda: {'hourly': {}, 'daily': {}})
+
+# In-memory rate limit storage
+# Format: {key: rate_limit_string}
+# This stores custom rate limits for each key
+rate_limits = {}
+
+
+def get_key_func(request: Request) -> str:
+    """
+    Extract the key from path parameters or use IP address as fallback.
+
+    This function is used by the rate limiter to determine which key to use
+    for rate limiting. It first checks if a key is provided in the path
+    parameters, and if not, falls back to the client's IP address.
+
+    Args:
+        request (Request): The FastAPI request object
+
+    Returns:
+        str: The key to use for rate limiting
+    """
+    if hasattr(request, 'path_params') and 'key' in request.path_params:
+        return request.path_params['key']
+    return get_remote_address(request)
+
+
+# Initialize rate limiter with our custom key function
+limiter = Limiter(key_func=get_key_func)
+app.state.limiter = limiter
+# Register the rate limit exceeded handler to return appropriate HTTP responses
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# Pydantic models for request/response validation
+class RateLimitConfig(BaseModel):
+    """
+    Model for configuring a rate limit for a specific key.
+
+    Attributes:
+        key (str): The key to configure the rate limit for
+        limit (str): The rate limit in format '{number}/{unit}' (e.g., '10/second')
+    """
+    key: str
+    limit: str
+
+
+class StatisticsResponse(BaseModel):
+    """
+    Model for statistics response.
+
+    Attributes:
+        key (str): The key the statistics are for
+        hourly_calls (Dict[str, int]): Hourly call counts indexed by timestamp
+        daily_calls (Dict[str, int]): Daily call counts indexed by timestamp
+        current_rate_limit (str): The current rate limit for this key
+    """
+    key: str
+    hourly_calls: Dict[str, int]
+    daily_calls: Dict[str, int]
+    current_rate_limit: str
+
+
+# Helper functions
+def get_rate_limit(key: str) -> str:
+    """
+    Get the rate limit for a specific key.
+
+    Checks if a custom rate limit exists for the key, and if not,
+    returns the default rate limit.
+
+    Args:
+        key (str): The key to get the rate limit for
+
+    Returns:
+        str: The rate limit in format '{number}/{unit}' (e.g., '10/second')
+    """
+    if key in rate_limits:
+        return rate_limits[key]
+    return DEFAULT_RATE_LIMIT
+
+
+def set_rate_limit(key: str, limit: str) -> None:
+    """
+    Set the rate limit for a specific key.
+
+    Args:
+        key (str): The key to set the rate limit for
+        limit (str): The rate limit in format '{number}/{unit}' (e.g., '10/second')
+    """
+    rate_limits[key] = limit
+
+
+def increment_stats(key: str) -> None:
+    """
+    Increment usage statistics for a key.
+
+    Updates both hourly and daily statistics for the given key.
+    Creates new counters if they don't exist yet.
+
+    Args:
+        key (str): The key to increment statistics for
+    """
+    now = datetime.now()
+    # Format: YYYY-MM-DD-HH
+    hourly_timestamp = now.strftime('%Y-%m-%d-%H')
+    # Format: YYYY-MM-DD
+    daily_timestamp = now.strftime('%Y-%m-%d')
+
+    # Update hourly statistics
+    if hourly_timestamp not in stats_storage[key]['hourly']:
+        stats_storage[key]['hourly'][hourly_timestamp] = 0
+    stats_storage[key]['hourly'][hourly_timestamp] += 1
+
+    # Update daily statistics
+    if daily_timestamp not in stats_storage[key]['daily']:
+        stats_storage[key]['daily'][daily_timestamp] = 0
+    stats_storage[key]['daily'][daily_timestamp] += 1
+
+
+def get_stats(key: str) -> dict:
+    """
+    Get usage statistics for a key.
+
+    Retrieves hourly statistics for the last 24 hours and
+    daily statistics for the last 30 days.
+
+    Args:
+        key (str): The key to get statistics for
+
+    Returns:
+        dict: A dictionary containing hourly and daily call counts
+    """
+    result = {'hourly_calls': {}, 'daily_calls': {}}
+    now = datetime.now()
+
+    # Only return data for the last 24 hours and 30 days
+    if key in stats_storage:
+        # Filter hourly data for the last 24 hours
+        for hour in range(24):
+            timestamp = (now - timedelta(hours=hour)).strftime('%Y-%m-%d-%H')
+            if timestamp in stats_storage[key]['hourly']:
+                result['hourly_calls'][timestamp] = stats_storage[key]['hourly'][timestamp]
+
+        # Filter daily data for the last 30 days
+        for day in range(30):
+            timestamp = (now - timedelta(days=day)).strftime('%Y-%m-%d')
+            if timestamp in stats_storage[key]['daily']:
+                result['daily_calls'][timestamp] = stats_storage[key]['daily'][timestamp]
+
+    return result
+
+
+# Dependency for rate limit checking
+async def check_rate_limit(request: Request, key: str):
+    """
+    Check if key is within rate limit and update statistics.
+
+    This dependency is used by endpoints to track usage statistics
+    regardless of whether the rate limit is exceeded.
+
+    Args:
+        request (Request): The FastAPI request object
+        key (str): The key to check the rate limit for
+
+    Returns:
+        str: The key that was checked
+    """
+    # This updates the statistics regardless of rate limit status
+    increment_stats(key)
+    # The actual rate limiting is handled by the decorator
+    return key
+
+
+# Routes
+@app.get('/check/{key}')
+@limiter.limit(get_rate_limit)  # Use the function directly without lambda
+async def check_rate_limit_endpoint(
+    request: Request,
+    key: str = Depends(check_rate_limit),
+):
+    """
+    Check if a key is within its rate limit and return the status.
+
+    This endpoint will return a 429 Too Many Requests response if
+    the rate limit is exceeded, or a 200 OK response if within limits.
+
+    Args:
+        request (Request): The FastAPI request object
+        key (str): The key to check, extracted from path parameter
+
+    Returns:
+        dict: A dictionary containing status information
+    """
+    return {
+        'status': 'ok',
+        'key': key,
+        'rate_limit': get_rate_limit(key),
+        'timestamp': datetime.now().isoformat(),
+    }
+
+
+@app.post('/configure', status_code=200)
+async def configure_rate_limit(config: RateLimitConfig):
+    """
+    Configure the rate limit for a specific key.
+
+    This endpoint allows setting a custom rate limit for a key.
+
+    Args:
+        config (RateLimitConfig): The configuration containing key and limit
+
+    Returns:
+        dict: A dictionary confirming the configuration
+    """
+    set_rate_limit(config.key, config.limit)
+    return {
+        'status': 'ok',
+        'key': config.key,
+        'rate_limit': config.limit,
+    }
+
+
+@app.get('/stats/{key}')
+async def get_statistics(key: str):
+    """
+    Get usage statistics for a specific key.
+
+    Returns hourly statistics for the last 24 hours and
+    daily statistics for the last 30 days.
+
+    Args:
+        key (str): The key to get statistics for
+
+    Returns:
+        dict: A dictionary containing usage statistics
+    """
+    stats = get_stats(key)
+    return {
+        'key': key,
+        'hourly_calls': stats['hourly_calls'],
+        'daily_calls': stats['daily_calls'],
+        'current_rate_limit': get_rate_limit(key),
+    }
+
+
+@app.get('/health')
+async def health_check():
+    """
+    Health check endpoint.
+
+    This endpoint is used to verify that the service is running correctly.
+    It always returns a 200 OK response with a timestamp.
+
+    Returns:
+        dict: A dictionary indicating service health
+    """
+    return {
+        'status': 'ok',
+        'timestamp': datetime.now().isoformat(),
+    }
+
+
+if __name__ == '__main__':
+    # Run the application with uvicorn when script is executed directly
+    import uvicorn
+    # Get port from environment variable or use default 8000
+    port = int(os.getenv('PORT', '8000'))
+    uvicorn.run(app, host='0.0.0.0', port=port)
+
+
+
+================================================
+FILE: rate-limiter/Dockerfile
+================================================
+FROM python:3.10.16-slim
+
+RUN apt-get update && apt-get install -y \
+    build-essential git\
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the PM2 process manager for Node.js
+RUN pip install poetry
+
+# Copy the application's dependencies files
+COPY poetry.lock pyproject.toml ./
+
+# Install the Python dependencies
+RUN poetry install --no-root
+
+# Copy the rest of the application's files
+COPY . .
+
+
+
+================================================
+FILE: rate-limiter/pyproject.toml
+================================================
+[tool.poetry]
+name = "rate-limiter"
+version = "0.1.0"
+description = "Simple rate limiting service"
+authors = ["Your Name <your.email@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.10.16"
+fastapi = "^0.109.0"
+uvicorn = "^0.27.0"
+slowapi = "^0.1.8"
+dotenv = "^0.9.9"
+pydantic = "^2.10.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+
+
+================================================
+FILE: scripts/entrypoint.py
+================================================
+#!/usr/bin/env python3
+import os
+import json
+import subprocess
+from string import Template
+from dotenv import load_dotenv
+
+CONFIG_DIR = 'config'  # Relative to WORKDIR (/app)
+TEMPLATE_FILE = os.path.join(CONFIG_DIR, 'settings.template.json')
+SETTINGS_FILE = os.path.join(CONFIG_DIR, 'settings.json')
+
+def fill_template():
+    """Fill settings template with environment variables"""
+    load_dotenv()  # Load .env file if present
+
+    if not os.path.exists(TEMPLATE_FILE):
+        print(f"ERROR: Template file not found at {TEMPLATE_FILE}")
+        exit(1)
+
+    with open(TEMPLATE_FILE, 'r') as f:
+        template = Template(f.read())
+
+    print("--- Substituting settings template ---")
+    try:
+        filled_str = template.substitute(os.environ)
+        # Validate if it's valid JSON before writing
+        json.loads(filled_str)
+    except KeyError as e:
+        print(f"ERROR: Missing environment variable for substitution: {e}. Check template and env vars.")
+        exit(1)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Substituted template resulted in invalid JSON: {e}")
+        print("--- Substituted Content ---")
+        print(filled_str)
+        print("--------------------------")
+        exit(1)
+    except Exception as e:
+        print(f"ERROR: Failed during template substitution: {e}")
+        exit(1)
+
+    print(f"Writing final settings to {SETTINGS_FILE}")
+    with open(SETTINGS_FILE, 'w') as f:
+        f.write(filled_str)
+    print("--- Settings substitution complete ---")
+
+if __name__ == "__main__":
+    fill_template()
+    print("Executing event detector: python event_detector.py")
+    result = subprocess.run(["python", "event_detector.py"], check=False)
+    exit(result.returncode)
+
+
+
+================================================
+FILE: scripts/generate_settings_template.py
+================================================
+import json
+import os
+
+def generate_template():
+    """Generate template settings.json with placeholder values"""
+    template = {
+        "source_rpc": {
+            "full_nodes": [
+                {
+                    "url": "${SOURCE_RPC_URL}",
+                    "rate_limit": {
+                        "requests_per_second": "${SOURCE_RPC_RATE_LIMIT}"
+                    }
+                }
+            ],
+            "archive_nodes": None,
+            "force_archive_blocks": None,
+            "retry": "${SOURCE_RPC_MAX_RETRIES}",
+            "request_time_out": "${SOURCE_RPC_TIMEOUT}",
+            "connection_limits": {
+                "max_connections": 100,
+                "max_keepalive_connections": 50,
+                "keepalive_expiry": 300
+            },
+            "polling_interval": "${SOURCE_RPC_POLLING_INTERVAL}",
+            "semaphore_value": 20
+        },
+        "powerloom_rpc": {
+            "full_nodes": [
+                {
+                    "url": "${POWERLOOM_RPC_URL}",
+                    "rate_limit": {
+                        "requests_per_second": "${POWERLOOM_RPC_RATE_LIMIT}"
+                    }
+                }
+            ],
+            "archive_nodes": None,
+            "force_archive_blocks": None,
+            "retry": "${POWERLOOM_RPC_RETRY}",
+            "request_time_out": "${POWERLOOM_RPC_TIMEOUT}",
+            "connection_limits": {
+                "max_connections": 100,
+                "max_keepalive_connections": 50,
+                "keepalive_expiry": 300
+            },
+            "polling_interval": "${POWERLOOM_RPC_POLLING_INTERVAL}",
+            "semaphore_value": 20
+        },
+        "logs": {
+            "write_to_files": "${WRITE_LOGS_TO_FILES}"
+        },
+        "redis": {
+            "host": "${REDIS_HOST}",
+            "port": "${REDIS_PORT}",
+            "db": "${REDIS_DB}",
+            "password": "${REDIS_PASSWORD}",
+            "ssl": "${REDIS_SSL}",
+            "cluster_mode": "${REDIS_CLUSTER_MODE}"
+        },
+        "protocol_state_contract_address": "${PROTOCOL_STATE_CONTRACT_ADDRESS}",
+        "data_market_contract_address": "${DATA_MARKET_CONTRACT_ADDRESS}",
+        "namespace": "${NAMESPACE}",
+        "instance_id": "${INSTANCE_ID}"
+    }
+
+    # Ensure config directory exists
+    config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config')
+    os.makedirs(config_dir, exist_ok=True)
+    template_path = os.path.join(config_dir, 'settings.template.json')
+
+    with open(template_path, 'w') as f:
+        json.dump(template, f, indent=2)
+    print(f"Generated template at {template_path}")
+
+if __name__ == "__main__":
+    generate_template()
+
+
+================================================
+FILE: utils/logging.py
+================================================
+import os
+import sys
+from pathlib import Path
+from loguru import logger
+
+# Create logs directory if it doesn't exist
+LOGS_DIR = Path("logs")
+LOGS_DIR.mkdir(exist_ok=True)
+
+# Remove default logger
+logger.remove()
+
+# Define severity levels and their corresponding files
+SEVERITY_FILES = {
+    "ERROR": "error.log",
+    "WARNING": "warning.log",
+    "CRITICAL": "critical.log",
+    "INFO": "info.log",
+    "DEBUG": "debug.log",
+    "TRACE": "trace.log",
+    "SUCCESS": "success.log"
+}
+
+# Common log format for files
+FILE_FORMAT = "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
+
+# Common log format for console (with colors)
+CONSOLE_FORMAT = "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+
+# Add console loggers for different severities
+logger.add(
+    sys.stdout,
+    format=CONSOLE_FORMAT,
+    level="INFO",
+    colorize=True,
+    filter=lambda record: record["level"].no < logger.level("WARNING").no
+)
+
+logger.add(
+    sys.stderr,
+    format=CONSOLE_FORMAT,
+    level="WARNING",
+    colorize=True,
+    filter=lambda record: record["level"].no >= logger.level("WARNING").no
+)
+
+def configure_file_logging(write_to_files: bool = True):
+    """Configure file-based logging based on settings."""
+    if write_to_files:
+        # Add file loggers for each severity level
+        for level, filename in SEVERITY_FILES.items():
+            logger.add(
+                LOGS_DIR / filename,
+                rotation="100 MB",
+                retention="7 days",
+                compression="zip",
+                format=FILE_FORMAT,
+                level=level,
+                backtrace=True,
+                diagnose=True,
+                filter=lambda record, level=level: record["level"].name == level
+            )
+
+# Export the configured logger
+__all__ = ["logger", "configure_file_logging"]
+
+
+
+================================================
+FILE: utils/abi/ProtocolContract.json
+================================================
+[
+  {
+    "inputs": [],
+    "stateMutability": "nonpayable",
+    "type": "constructor"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "target",
+        "type": "address"
+      }
+    ],
+    "name": "AddressEmptyCode",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "implementation",
+        "type": "address"
+      }
+    ],
+    "name": "ERC1967InvalidImplementation",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ERC1967NonPayable",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "FailedCall",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidInitialization",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotInitializing",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "owner",
+        "type": "address"
+      }
+    ],
+    "name": "OwnableInvalidOwner",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "account",
+        "type": "address"
+      }
+    ],
+    "name": "OwnableUnauthorizedAccount",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "UUPSUnauthorizedCallContext",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "slot",
+        "type": "bytes32"
+      }
+    ],
+    "name": "UUPSUnsupportedProxiableUUID",
+    "type": "error"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "adminAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "bool",
+        "name": "allowed",
+        "type": "bool"
+      }
+    ],
+    "name": "AdminsUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "BatchSubmissionsCompleted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "snapshotterAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "slotId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "dayId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "DailyTaskCompletedEvent",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "ownerAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint8",
+        "name": "epochSize",
+        "type": "uint8"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "sourceChainId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "sourceChainBlockTime",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "bool",
+        "name": "useBlockNumberAsEpochId",
+        "type": "bool"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "protocolState",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      }
+    ],
+    "name": "DataMarketCreated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "dayId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "DayStartedEvent",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "validatorAddr",
+        "type": "address"
+      }
+    ],
+    "name": "DelayedAttestationSubmitted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "DelayedBatchSubmitted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "snapshotterAddr",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "slotId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "snapshotCid",
+        "type": "string"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "projectId",
+        "type": "string"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "DelayedSnapshotSubmitted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "owner",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "amount",
+        "type": "uint256"
+      }
+    ],
+    "name": "EmergencyWithdraw",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "begin",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "end",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "EpochReleased",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "uint64",
+        "name": "version",
+        "type": "uint64"
+      }
+    ],
+    "name": "Initialized",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "previousOwner",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "newOwner",
+        "type": "address"
+      }
+    ],
+    "name": "OwnershipTransferred",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "user",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "amount",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "RewardsClaimed",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "snapshotterAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "slotId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "dayId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "rewardPoints",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "RewardsDistributedEvent",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "sequencerAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "bool",
+        "name": "allowed",
+        "type": "bool"
+      }
+    ],
+    "name": "SequencersUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "validatorAddr",
+        "type": "address"
+      }
+    ],
+    "name": "SnapshotBatchAttestationSubmitted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "SnapshotBatchFinalized",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "SnapshotBatchSubmitted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "epochEnd",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "projectId",
+        "type": "string"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "snapshotCid",
+        "type": "string"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "SnapshotFinalized",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "TriggerBatchResubmission",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "implementation",
+        "type": "address"
+      }
+    ],
+    "name": "Upgraded",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "validator",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "ValidatorAttestationsInvalidated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "validatorAddress",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "bool",
+        "name": "allowed",
+        "type": "bool"
+      }
+    ],
+    "name": "ValidatorsUpdated",
+    "type": "event"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "DAY_SIZE",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "EPOCH_SIZE",
+    "outputs": [
+      {
+        "internalType": "uint8",
+        "name": "",
+        "type": "uint8"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "SOURCE_CHAIN_BLOCK_TIME",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "SOURCE_CHAIN_ID",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "UPGRADE_INTERFACE_VERSION",
+    "outputs": [
+      {
+        "internalType": "string",
+        "name": "",
+        "type": "string"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "USE_BLOCK_NUMBER_AS_EPOCH_ID",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "addr",
+        "type": "address"
+      }
+    ],
+    "name": "allSnapshotters",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "attestationSubmissionWindow",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "internalType": "address",
+        "name": "validator",
+        "type": "address"
+      }
+    ],
+    "name": "attestationsReceived",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "finalizedCidsRootHash",
+        "type": "bytes32"
+      }
+    ],
+    "name": "attestationsReceivedCount",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      }
+    ],
+    "name": "batchCidAttestationStatus",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "idx",
+        "type": "uint256"
+      }
+    ],
+    "name": "batchCidDivergentValidators",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      }
+    ],
+    "name": "batchCidSequencerAttestation",
+    "outputs": [
+      {
+        "internalType": "bytes32",
+        "name": "",
+        "type": "bytes32"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      }
+    ],
+    "name": "batchCidToProjects",
+    "outputs": [
+      {
+        "internalType": "string[]",
+        "name": "",
+        "type": "string[]"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "batchSubmissionWindow",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      }
+    ],
+    "name": "checkDynamicConsensusAttestations",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "slotId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "day",
+        "type": "uint256"
+      }
+    ],
+    "name": "checkSlotTaskStatusForDay",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "_user",
+        "type": "address"
+      }
+    ],
+    "name": "claimRewards",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "ownerAddress",
+        "type": "address"
+      },
+      {
+        "internalType": "uint8",
+        "name": "epochSize",
+        "type": "uint8"
+      },
+      {
+        "internalType": "uint256",
+        "name": "sourceChainId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "sourceChainBlockTime",
+        "type": "uint256"
+      },
+      {
+        "internalType": "bool",
+        "name": "useBlockNumberAsEpochId",
+        "type": "bool"
+      }
+    ],
+    "name": "createDataMarket",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "currentEpoch",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "begin",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "end",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "dailySnapshotQuota",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "dataMarketCount",
+    "outputs": [
+      {
+        "internalType": "uint8",
+        "name": "",
+        "type": "uint8"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      }
+    ],
+    "name": "dataMarketEnabled",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "dataMarketFactory",
+    "outputs": [
+      {
+        "internalType": "contract DataMarketFactory",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint8",
+        "name": "dataMarketId",
+        "type": "uint8"
+      }
+    ],
+    "name": "dataMarketIdToAddress",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "name": "dataMarkets",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "ownerAddress",
+        "type": "address"
+      },
+      {
+        "internalType": "uint8",
+        "name": "epochSize",
+        "type": "uint8"
+      },
+      {
+        "internalType": "uint256",
+        "name": "sourceChainId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "sourceChainBlockTime",
+        "type": "uint256"
+      },
+      {
+        "internalType": "bool",
+        "name": "useBlockNumberAsEpochId",
+        "type": "bool"
+      },
+      {
+        "internalType": "bool",
+        "name": "enabled",
+        "type": "bool"
+      },
+      {
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "createdAt",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "dayCounter",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "deploymentBlockNumber",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "emergencyWithdraw",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "enabledNodeCount",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      }
+    ],
+    "name": "endBatchSubmissions",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      }
+    ],
+    "name": "epochIdToBatchCids",
+    "outputs": [
+      {
+        "internalType": "string[]",
+        "name": "",
+        "type": "string[]"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      }
+    ],
+    "name": "epochInfo",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "blocknumber",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "epochEnd",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "epochManager",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "epochsInADay",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      }
+    ],
+    "name": "forceCompleteConsensusAttestations",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "begin",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "end",
+        "type": "uint256"
+      }
+    ],
+    "name": "forceSkipEpoch",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "getEpochManager",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "getSequencerId",
+    "outputs": [
+      {
+        "internalType": "string",
+        "name": "",
+        "type": "string"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "getSequencers",
+    "outputs": [
+      {
+        "internalType": "address[]",
+        "name": "",
+        "type": "address[]"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "slotId",
+        "type": "uint256"
+      }
+    ],
+    "name": "getSlotInfo",
+    "outputs": [
+      {
+        "components": [
+          {
+            "internalType": "uint256",
+            "name": "slotId",
+            "type": "uint256"
+          },
+          {
+            "internalType": "address",
+            "name": "snapshotterAddress",
+            "type": "address"
+          },
+          {
+            "internalType": "uint256",
+            "name": "rewardPoints",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "currentDaySnapshotCount",
+            "type": "uint256"
+          }
+        ],
+        "internalType": "struct PowerloomDataMarket.SlotInfo",
+        "name": "",
+        "type": "tuple"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "slotId",
+        "type": "uint256"
+      }
+    ],
+    "name": "getSlotRewards",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "rewards",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "getTotalNodeCount",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "getTotalSequencersCount",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "getTotalSnapshotterCount",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "getTotalValidatorsCount",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "getValidators",
+    "outputs": [
+      {
+        "internalType": "address[]",
+        "name": "",
+        "type": "address[]"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "initialOwner",
+        "type": "address"
+      }
+    ],
+    "name": "initialize",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "projectId",
+        "type": "string"
+      }
+    ],
+    "name": "lastFinalizedSnapshot",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "projectId",
+        "type": "string"
+      }
+    ],
+    "name": "lastSequencerFinalizedSnapshot",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "_dayCounter",
+        "type": "uint256"
+      }
+    ],
+    "name": "loadCurrentDay",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "slotId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "dayId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "snapshotCount",
+        "type": "uint256"
+      }
+    ],
+    "name": "loadSlotSubmissions",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      }
+    ],
+    "name": "maxAttestationFinalizedRootHash",
+    "outputs": [
+      {
+        "internalType": "bytes32",
+        "name": "",
+        "type": "bytes32"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      }
+    ],
+    "name": "maxAttestationsCount",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "projectId",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      }
+    ],
+    "name": "maxSnapshotsCid",
+    "outputs": [
+      {
+        "internalType": "string",
+        "name": "",
+        "type": "string"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "minAttestationsForConsensus",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "owner",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "projectId",
+        "type": "string"
+      }
+    ],
+    "name": "projectFirstEpochId",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "proxiableUUID",
+    "outputs": [
+      {
+        "internalType": "bytes32",
+        "name": "",
+        "type": "bytes32"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "begin",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "end",
+        "type": "uint256"
+      }
+    ],
+    "name": "releaseEpoch",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "renounceOwnership",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "rewardPoolSize",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "rewardsEnabled",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "_sequencerId",
+        "type": "string"
+      }
+    ],
+    "name": "setSequencerId",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "slotId",
+        "type": "uint256"
+      }
+    ],
+    "name": "slotRewardPoints",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "name": "slotRewards",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "slotId",
+        "type": "uint256"
+      }
+    ],
+    "name": "slotSnapshotterMapping",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "slotId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "dayId",
+        "type": "uint256"
+      }
+    ],
+    "name": "slotSubmissionCount",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "projectId",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      }
+    ],
+    "name": "snapshotStatus",
+    "outputs": [
+      {
+        "internalType": "enum PowerloomDataMarket.SnapshotStatus",
+        "name": "status",
+        "type": "uint8"
+      },
+      {
+        "internalType": "string",
+        "name": "snapshotCid",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "snapshotSubmissionWindow",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "snapshotterState",
+    "outputs": [
+      {
+        "internalType": "contract PowerloomNodes",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "finalizedCidsRootHash",
+        "type": "bytes32"
+      }
+    ],
+    "name": "submitBatchAttestation",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "batchCid",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "epochId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "string[]",
+        "name": "projectIds",
+        "type": "string[]"
+      },
+      {
+        "internalType": "string[]",
+        "name": "snapshotCids",
+        "type": "string[]"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "finalizedCidsRootHash",
+        "type": "bytes32"
+      }
+    ],
+    "name": "submitSubmissionBatch",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "dataMarketAddress",
+        "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "enabled",
+        "type": "bool"
+      }
+    ],
+    "name": "toggleDataMarket",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      }
+    ],
+    "name": "toggleRewards",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "newOwner",
+        "type": "address"
+      }
+    ],
+    "name": "transferOwnership",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "enum PowerloomDataMarket.Role",
+        "name": "role",
+        "type": "uint8"
+      },
+      {
+        "internalType": "address[]",
+        "name": "_addresses",
+        "type": "address[]"
+      },
+      {
+        "internalType": "bool[]",
+        "name": "_status",
+        "type": "bool[]"
+      }
+    ],
+    "name": "updateAddresses",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "newattestationSubmissionWindow",
+        "type": "uint256"
+      }
+    ],
+    "name": "updateAttestationSubmissionWindow",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "newbatchSubmissionWindow",
+        "type": "uint256"
+      }
+    ],
+    "name": "updateBatchSubmissionWindow",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "_dailySnapshotQuota",
+        "type": "uint256"
+      }
+    ],
+    "name": "updateDailySnapshotQuota",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "_address",
+        "type": "address"
+      }
+    ],
+    "name": "updateDataMarketFactory",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "newDaySize",
+        "type": "uint256"
+      }
+    ],
+    "name": "updateDaySize",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "_address",
+        "type": "address"
+      }
+    ],
+    "name": "updateEpochManager",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "_minAttestationsForConsensus",
+        "type": "uint256"
+      }
+    ],
+    "name": "updateMinAttestationsForConsensus",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "newRewardPoolSize",
+        "type": "uint256"
+      }
+    ],
+    "name": "updateRewardPoolSize",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256[]",
+        "name": "slotIds",
+        "type": "uint256[]"
+      },
+      {
+        "internalType": "uint256[]",
+        "name": "submissionsList",
+        "type": "uint256[]"
+      },
+      {
+        "internalType": "uint256",
+        "name": "day",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "eligibleNodes",
+        "type": "uint256"
+      }
+    ],
+    "name": "updateRewards",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "newsnapshotSubmissionWindow",
+        "type": "uint256"
+      }
+    ],
+    "name": "updateSnapshotSubmissionWindow",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "_address",
+        "type": "address"
+      }
+    ],
+    "name": "updateSnapshotterState",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "newImplementation",
+        "type": "address"
+      },
+      {
+        "internalType": "bytes",
+        "name": "data",
+        "type": "bytes"
+      }
+    ],
+    "name": "upgradeToAndCall",
+    "outputs": [],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "name": "userInfo",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "totalRewards",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "totalClaimed",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "lastClaimed",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "lastUpdated",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "stateMutability": "payable",
+    "type": "receive"
+  }
+]
+
+
+================================================
+FILE: utils/models/message_models.py
+================================================
+from pydantic import BaseModel
+
+class EpochReleasedEvent(BaseModel):
+    begin: int
+    end: int
+    epochId: int
+    timestamp: int
+
+
+class SnapshotBatchSubmittedEvent(BaseModel):
+    """
+    Event model for when a snapshot batch is finalized.
+    """
+    epochId: int
+    batchCid: str
+    timestamp: int
+    transactionHash: str
+
+
+
+================================================
+FILE: utils/models/settings_model.py
+================================================
+from pydantic import BaseModel
+from rpc_helper.utils.models.settings_model import RPCConfigFull
+from typing import List, Optional, Union
+
+class RateLimitConfig(BaseModel):
+    """RPC Rate limit configuration model."""
+    requests_per_second: int
+
+class Logs(BaseModel):
+    """Logging configuration model."""
+    write_to_files: bool = True
+
+class Redis(BaseModel):
+    """Redis configuration model."""
+    host: str
+    port: int
+    db: int
+    password: Union[str, None] = None
+    ssl: bool = False
+    cluster_mode: bool = False
+
+class Settings(BaseModel):
+    """Main settings configuration model."""
+    source_rpc: RPCConfigFull
+    powerloom_rpc: RPCConfigFull
+    logs: Logs
+    redis: Redis
+    protocol_state_contract_address: str
+    data_market_contract_address: str
+    namespace: str
+    instance_id: str
+
+
+================================================
+FILE: utils/redis/redis_conn.py
+================================================
+import redis.asyncio as aioredis
+from config.loader import get_core_config # Adjusted import path
+from utils.logging import logger # Adjusted import path
+import asyncio
+from typing import Optional
+
+class RedisPool:
+    _pool: Optional[aioredis.Redis] = None
+    _lock = asyncio.Lock()
+
+    def __init__(self):
+        # Private constructor to prevent direct instantiation
+        self.settings = get_core_config()
+        self._logger = logger.bind(module='RedisPool')
+
+    @classmethod
+    async def get_pool(cls) -> aioredis.Redis:
+        """Get or create Redis connection pool."""
+        if cls._pool is None:
+            async with cls._lock:
+                # Double-check locking
+                if cls._pool is None:
+                    instance = cls()
+                    redis_settings = instance.settings.redis
+                    redis_url = f"redis{'s' if redis_settings.ssl else ''}://{':' + redis_settings.password + '@' if redis_settings.password else ''}{redis_settings.host}:{redis_settings.port}/{redis_settings.db}"
+                    try:
+                        instance._logger.info(f"Creating Redis connection pool for {redis_settings.host}:{redis_settings.port}/{redis_settings.db}")
+                        cls._pool = await aioredis.from_url(
+                            redis_url,
+                            encoding="utf-8",
+                            decode_responses=True,
+                            # max_connections=100 # Adjust pool size if needed
+                        )
+                        # Test connection
+                        await cls._pool.ping()
+                        instance._logger.success("✅ Successfully connected to Redis.")
+                    except Exception as e:
+                        instance._logger.error(f"💥 Failed to connect to Redis at {redis_url}: {e}")
+                        raise ConnectionError(f"Failed to initialize Redis pool: {e}") from e
+        return cls._pool
+
+    @classmethod
+    async def close(cls):
+        """Close the Redis connection pool."""
+        if cls._pool:
+            logger.info("Closing Redis connection pool...")
+            await cls._pool.close()
+            # await cls._pool.connection_pool.disconnect() # For older redis versions
+            cls._pool = None
+            logger.info("Redis connection pool closed.")
+
+
+================================================
+FILE: utils/redis/redis_keys.py
+================================================
+def block_tx_htable_key(namespace: str, block_number: int) -> str:
+    return f'block_txs:{block_number}:{namespace}'
+
+
+def block_cache_key(namespace: str) -> str:
+    """Key for sorted set storing cached block details."""
+    return f'block_cache:{namespace}'
+
+
+def event_detector_last_processed_block(namespace: str) -> str:
+    return f'SystemEventDetector:lastProcessedBlock:{namespace}'
+
+
