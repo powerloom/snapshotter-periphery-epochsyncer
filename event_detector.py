@@ -376,24 +376,12 @@ class EpochEventDetector:
                     current_block = await self._source_rpc_helper.get_current_block_number()
                     
                     if not self._last_processed_block_source_chain:
-                        # Load from Redis or start from recent block
-                        last_processed_block_data = await self._redis.get(
-                            f"{event_detector_last_processed_block(self.settings.namespace)}:SourceChain",
+                        # Always start from current block (no Redis restore - avoids backlog flood on restart)
+                        self._last_processed_block_source_chain = current_block - 1
+                        self.logger.info(
+                            "Starting from source chain block {} (no checkpoint restore)",
+                            self._last_processed_block_source_chain
                         )
-
-                        if last_processed_block_data:
-                            self._last_processed_block_source_chain = int(last_processed_block_data)
-                            self.logger.info(
-                                "Loaded last processed source chain block from redis: {}", 
-                                self._last_processed_block_source_chain
-                            )
-                            first_run = False
-                        else:
-                            self._last_processed_block_source_chain = current_block - 1
-                            self.logger.info(
-                                "Starting to listen from source chain block {}", 
-                                self._last_processed_block_source_chain
-                            )
                     
                     if current_block > self._last_processed_block_source_chain:
                         # Calculate blocks to process
