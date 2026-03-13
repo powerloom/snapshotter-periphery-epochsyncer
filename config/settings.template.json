@@ -34,7 +34,7 @@
     "polling_interval": "${POWERLOOM_RPC_POLLING_INTERVAL}"
   },
   "logs": {
-    "write_to_files": "${WRITE_LOGS_TO_FILES}"
+    "write_to_files": ${WRITE_LOGS_TO_FILES}
   },
   "redis": {
     "host": "${REDIS_HOST}",

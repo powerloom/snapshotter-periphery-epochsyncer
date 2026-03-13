@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import dramatiq
 from web3 import Web3
 from dramatiq.brokers.redis import RedisBroker
@@ -551,8 +552,14 @@ class EpochEventDetector:
 
 
 async def main():
-    # Configure logging
-    configure_file_logging()
+    # LOG_TO_FILES / WRITE_LOGS_TO_FILES env overrides config (avoids template/coercion issues)
+    settings = get_core_config()
+    write_to_files = settings.logs.write_to_files
+    for env_key in ("LOG_TO_FILES", "WRITE_LOGS_TO_FILES"):
+        if (v := os.getenv(env_key)) is not None:
+            write_to_files = str(v).strip().lower() in ("true", "1", "yes")
+            break
+    configure_file_logging(write_to_files=write_to_files)
     
     # Create and start detector
     detector = EpochEventDetector()
